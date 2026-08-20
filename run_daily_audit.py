@@ -247,7 +247,7 @@ for col in ['Brochure_File_Found', 'Matched_Brochure_Path', 'Accuracy_Status', '
 
 df['Discrepancies_Flagged'] = df['Discrepancies_Flagged'].astype('object')
 df['Accuracy_Status'] = df['Accuracy_Status'].astype('object')
-for spec in BINARY_SPECS:
+for spec in BINARY_SPECS + NUMERIC_SPECS + TEXT_SPECS:
     if spec in df.columns:
         df[spec] = df[spec].astype('object')
 
@@ -268,12 +268,23 @@ def tokenize(s: str) -> list:
     return _word_re.findall(str(s).lower())
 
 print("\nListing brochure PDFs on Drive...")
-pdf_index = {}      # file_id -> set(tokens from its virtual path)
-pdf_vpaths = {}      # file_id -> human-readable virtual path (for logs/filenames)
+pdf_index = {}       # file_id -> set(tokens from its virtual path, both variants)
+pdf_vpaths = {}       # file_id -> human-readable virtual path (for logs/filenames)
+pdf_search_variants = {}  # file_id -> (original_clean, split_clean) text pair used
+                          # for regex whole-word matching. 'split_clean' adds a
+                          # boundary at every letter<->digit transition so a
+                          # glued model code like 'Rich7' still matches the
+                          # sheet's separated 'Rich 7' -- checked in ADDITION to
+                          # the original text, not instead of it, since an
+                          # already-separated code like 'H9-catalogue.pdf' must
+                          # keep matching 'H9' as a single token too.
 for file_id, vpath in drive_utils.list_pdfs_recursive(drive, GDRIVE_BROCHURES_FOLDER_ID):
-    clean = re.sub(r'[^a-z0-9]', ' ', vpath.lower())
-    pdf_index[file_id] = set(tokenize(clean))
+    original_clean = re.sub(r'[^a-z0-9]', ' ', vpath.lower())
+    split_clean = re.sub(r'(?<=[0-9])(?=[a-z])', ' ', original_clean)
+    split_clean = re.sub(r'(?<=[a-z])(?=[0-9])', ' ', split_clean)
+    pdf_index[file_id] = set(tokenize(original_clean)) | set(tokenize(split_clean))
     pdf_vpaths[file_id] = vpath
+    pdf_search_variants[file_id] = (original_clean, split_clean)
 print(f"Total PDFs found: {len(pdf_index)}")
 
 def find_best_match(make, model, generation, start_year, end_year):
@@ -289,31 +300,50 @@ def find_best_match(make, model, generation, start_year, end_year):
     if not make_tokens or not model_tokens:
         return None, "Flagged: Missing Make/Model in Sheet", None
 
-    candidates = []
-    for file_id, path_tokens in pdf_index.items():
-        path_lower = pdf_vpaths[file_id].lower()
-        if not make_tokens.issubset(path_tokens):
-            continue
-
-        match_all = True
+    def model_tokens_present(path_variants, path_tokens):
         for m_token in model_tokens:
             pattern = r'(?<![a-z0-9])' + re.escape(m_token) + r'(?![a-z0-9])'
-            if not re.search(pattern, path_lower):
-                match_all = False
-                break
-        if not match_all:
-            continue
+            if not any(re.search(pattern, variant) for variant in path_variants):
+                return False
+        return True
 
+    # --- Tier 1: make AND model tokens both present (order doesn't matter --
+    # token search, not positional) ---
+    candidates = []
+    for file_id, path_tokens in pdf_index.items():
+        path_variants = pdf_search_variants[file_id]
+        if not make_tokens.issubset(path_tokens):
+            continue
+        if not model_tokens_present(path_variants, path_tokens):
+            continue
         gen_tokens = set(tokenize(generation)) if generation and str(generation).lower() != 'nan' else set()
         gen_hits = len(gen_tokens & path_tokens)
         score = (gen_hits, -len(path_tokens))
         candidates.append((score, file_id))
 
-    if not candidates:
-        return None, "Flagged: Missing Brochure PDF", None
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1], None, "Exact"
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1], None, "Exact"
+    # --- Tier 2: many brochure filenames omit the manufacturer entirely
+    # (e.g. 'H9-catalogue-UAE-EN-compressed.pdf', 'Rich7.pdf', 'Dargo.pdf').
+    # Fall back to matching on model tokens alone. If more than one distinct
+    # brochure matches, we can't safely guess which manufacturer it belongs
+    # to (model codes like H9/S7/T5 get reused across different Chinese-
+    # market brands) -- flag it for a human instead of picking one. ---
+    tier2_candidates = []
+    for file_id, path_tokens in pdf_index.items():
+        path_variants = pdf_search_variants[file_id]
+        if not model_tokens_present(path_variants, path_tokens):
+            continue
+        tier2_candidates.append(file_id)
+
+    if len(tier2_candidates) == 1:
+        return tier2_candidates[0], None, "Model-Only"
+    if len(tier2_candidates) > 1:
+        return None, "Flagged: Ambiguous Brochure Match", None
+
+    return None, "Flagged: Missing Brochure PDF", None
 
 print("Matching rows against brochures...")
 rematched_count = 0
@@ -475,7 +505,7 @@ def call_gemini_with_retry(user_prompt: str):
 def normalize_trim_key(name):
     return re.sub(r'[^a-z0-9]', '', str(name).lower())
 
-def audit_group_gemini(make, model, generation, pdf_text, group_rows):
+def audit_group_gemini(make, model, generation, pdf_text, group_rows, match_confidence='Exact'):
     all_results = []
     all_missing_trims = []
     all_version_names = [str(row.get(VERSION_COL, '')) for _, row in group_rows]
@@ -493,9 +523,21 @@ def audit_group_gemini(make, model, generation, pdf_text, group_rows):
                 "current_specs": current_specs
             })
 
+        confidence_note = ""
+        if match_confidence == "Model-Only":
+            confidence_note = (
+                "\nMATCH CONFIDENCE: Model-Only. This brochure's filename did not contain the "
+                "manufacturer name, so it was matched by model name/code alone. Model codes "
+                "(e.g. H9, S7, T5) are sometimes reused across different brands. Before "
+                "reporting any spec, first confirm from the BROCHURE TEXT itself that the "
+                f"manufacturer is actually '{make}' and the model is '{model}'. If the brochure "
+                "text shows a different manufacturer than expected, set "
+                "brochure_covers_this_version to false instead of reporting specs.\n"
+            )
+
         user_prompt = f"""
 VEHICLE: {make} {model} ({generation})
-VERSIONS: {json.dumps(versions_payload)}
+{confidence_note}VERSIONS: {json.dumps(versions_payload)}
 KNOWN TRIMS: {json.dumps(all_version_names)}
 
 BROCHURE TEXT:
@@ -612,8 +654,10 @@ def run_pipeline():
             continue
 
         first_row = g_rows[0][1]
+        match_confidence = first_row.get('Match_Confidence', 'Exact')
         results, missing_trims = audit_group_gemini(
-            first_row.get(MAKE_COL), first_row.get(MODEL_COL), first_row.get(GEN_COL), pdf_text, g_rows
+            first_row.get(MAKE_COL), first_row.get(MODEL_COL), first_row.get(GEN_COL), pdf_text, g_rows,
+            match_confidence
         )
 
         for trim in missing_trims:
