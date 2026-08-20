@@ -1,6 +1,8 @@
-google-genai>=0.3
+# requirements for audit and email scripts
 pandas
-pypdf
+requests
+beautifulsoup4
 openpyxl
-google-api-python-client
-google-auth
+python-dotenv
+openai
+pdfplumber

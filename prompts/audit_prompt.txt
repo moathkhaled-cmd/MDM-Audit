@@ -1,0 +1,16 @@
+Answer with ONLY comma-separated 0 or 1 values corresponding exactly to the feature list provided.
+Do NOT output any explanation, extra text, JSON, or markup. Only return a single short line like: 1,0,0,1
+
+Rules for the model:
+- Use ONLY the provided SOURCE_TEXT. Do NOT assume facts not present there.
+- For each feature in the list, reply 1 if the SOURCE_TEXT shows clear evidence the product supports that feature, otherwise reply 0.
+- If SOURCE_TEXT is empty or does not contain evidence, return 0 for that feature.
+- Do NOT invent, guess, or hallucinate anything.
+- Keep output minimal and strictly in the same order as the feature list.
+
+Product: {PRODUCT_NAME}
+Features (order MUST be preserved):
+{FEATURE_LIST}
+
+SOURCE_TEXT:
+{SOURCE_TEXT}
