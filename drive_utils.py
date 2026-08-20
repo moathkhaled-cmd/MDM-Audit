@@ -20,7 +20,39 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 def get_drive_service():
     creds_path = os.environ['GDRIVE_SERVICE_ACCOUNT_FILE']
     creds = service_account.Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-    return build('drive', 'v3', credentials=creds)
+    return build('drive', 'v3', credentials=creds), creds.service_account_email
+
+
+def check_folder_access(service, folder_id, label, service_account_email):
+    """Fetches folder_id's own metadata (not its children) so a bad ID or a
+    missing share fails fast with a clear message instead of a raw 404 deep
+    inside a list() call."""
+    try:
+        meta = service.files().get(
+            fileId=folder_id,
+            fields="id, name, mimeType, driveId",
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as e:
+        raise SystemExit(
+            f"\n[CONFIG ERROR] Could not access {label} (id: {folder_id!r}).\n"
+            f"  Service account: {service_account_email}\n"
+            f"  Raw error: {e}\n\n"
+            f"  Checklist:\n"
+            f"  1. In Drive, right-click the folder -> Share -> add "
+            f"{service_account_email} as Editor (this is the #1 cause).\n"
+            f"  2. Confirm the ID itself: open the folder in a browser, copy only "
+            f"the segment after '/folders/' in the URL — not the whole URL, and "
+            f"watch for a trailing '/' or '?usp=sharing' getting pasted along with it.\n"
+            f"  3. If this folder lives inside a Shared Drive (Team Drive) rather "
+            f"than My Drive, the service account also needs to be added as a "
+            f"member of that Shared Drive itself, not just the folder.\n"
+        )
+    if meta.get('mimeType') != 'application/vnd.google-apps.folder':
+        raise SystemExit(f"\n[CONFIG ERROR] {label} (id: {folder_id!r}) is not a folder "
+                          f"(mimeType={meta.get('mimeType')}). Double check the ID.\n")
+    print(f"  OK: {label} -> '{meta.get('name')}'")
+    return meta
 
 
 def list_children(service, folder_id):
@@ -32,6 +64,8 @@ def list_children(service, folder_id):
             fields="nextPageToken, files(id, name, mimeType)",
             pageToken=page_token,
             pageSize=1000,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
         ).execute()
         for f in resp.get('files', []):
             yield f['id'], f['name'], f['mimeType']
@@ -61,7 +95,7 @@ def find_file_id_by_name(service, folder_id, name):
 
 
 def download_bytes(service, file_id) -> bytes:
-    request = service.files().get_media(fileId=file_id)
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
     done = False
@@ -86,8 +120,8 @@ def upload_or_update(service, folder_id, local_path, remote_name=None, mime_type
     existing_id = find_file_id_by_name(service, folder_id, remote_name)
     media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
     if existing_id:
-        service.files().update(fileId=existing_id, media_body=media).execute()
+        service.files().update(fileId=existing_id, media_body=media, supportsAllDrives=True).execute()
         return existing_id
     file_metadata = {'name': remote_name, 'parents': [folder_id]}
-    created = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+    created = service.files().create(body=file_metadata, media_body=media, fields='id', supportsAllDrives=True).execute()
     return created['id']
