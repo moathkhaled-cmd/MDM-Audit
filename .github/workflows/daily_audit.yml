@@ -1,0 +1,46 @@
+name: Daily MDM Spec Audit
+
+on:
+  schedule:
+    # 06:00 UTC daily = 10:00 AM UAE/KSA (UTC+4). Adjust the hour to taste —
+    # GitHub's cron can run a few minutes late, that's normal.
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}   # adds a "Run workflow" button in the Actions tab for manual runs
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google service account key
+        run: echo '${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}' > service_account.json
+
+      - name: Run today's audit batch
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GDRIVE_SERVICE_ACCOUNT_FILE: service_account.json
+          GDRIVE_ROOT_FOLDER_ID: ${{ vars.GDRIVE_ROOT_FOLDER_ID }}
+          GDRIVE_BROCHURES_FOLDER_ID: ${{ vars.GDRIVE_BROCHURES_FOLDER_ID }}
+          DAILY_REQUEST_CAP: ${{ vars.DAILY_REQUEST_CAP }}
+        run: python run_daily_audit.py
+
+      - name: Remove credentials
+        if: always()
+        run: rm -f service_account.json
+
+      - name: Upload run logs as a build artifact (backup / debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-run-data
+          path: run_data/
+          retention-days: 14
