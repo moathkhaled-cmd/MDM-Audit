@@ -1,0 +1,6 @@
+openai>=1.0
+pandas
+pypdf
+openpyxl
+google-api-python-client
+google-auth
