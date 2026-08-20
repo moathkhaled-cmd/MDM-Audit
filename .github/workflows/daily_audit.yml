@@ -28,8 +28,8 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GDRIVE_SERVICE_ACCOUNT_FILE: service_account.json
-          GDRIVE_ROOT_FOLDER_ID: ${{ vars.GDRIVE_ROOT_FOLDER_ID }}
-          GDRIVE_BROCHURES_FOLDER_ID: ${{ vars.GDRIVE_BROCHURES_FOLDER_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_ROOT_FOLDER_ID }}
+          GDRIVE_BROCHURES_FOLDER_ID: ${{ secrets.GDRIVE_BROCHURES_FOLDER_ID }}
           DAILY_REQUEST_CAP: ${{ vars.DAILY_REQUEST_CAP }}
           RATE_LIMIT_RPM: ${{ vars.RATE_LIMIT_RPM }}
         run: python run_daily_audit.py
