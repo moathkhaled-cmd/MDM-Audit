@@ -94,17 +94,31 @@ GROUP_BATCH_SIZE = 10
 SAVE_EVERY_N_GROUPS = 5
 MAX_RETRIES = 5
 
+def get_int_env(name, default):
+    """Reads an int env var, falling back to default if unset OR empty.
+
+    GitHub Actions sets an env var to '' (not omitted) when it's assigned
+    from a repo variable/secret that doesn't exist, e.g.
+    `RATE_LIMIT_RPM: ${{ vars.RATE_LIMIT_RPM }}` with no such repo variable
+    defined. In that case os.environ.get(name, default) still returns ''
+    (the key IS present), so int() blows up. This checks for that case
+    explicitly.
+    """
+    val = os.environ.get(name, '').strip()
+    return int(val) if val else default
+
+
 # Free-tier Gemini Flash is typically ~10-15 RPM depending on your account —
 # check https://ai.google.dev/gemini-api/docs/rate-limits and set this to
 # roughly 80% of your actual limit.
-RATE_LIMIT_RPM = int(os.environ.get('RATE_LIMIT_RPM', '10'))
+RATE_LIMIT_RPM = get_int_env('RATE_LIMIT_RPM', 10)
 SLEEP_BETWEEN_REQUESTS = 60.0 / RATE_LIMIT_RPM
 
 # This is what makes it a genuine daily partition: each GitHub Actions run
 # does at most this many requests, then stops cleanly and picks back up on
 # tomorrow's scheduled run. Gemini free tier is also capped per-day (varies
 # by model/account) — set this to comfortably under your actual daily quota.
-DAILY_REQUEST_CAP = int(os.environ.get('DAILY_REQUEST_CAP', '100'))
+DAILY_REQUEST_CAP = get_int_env('DAILY_REQUEST_CAP', 100)
 
 MAKE_COL, MODEL_COL, GEN_COL, VERSION_COL = (
     'manufacturer_name', 'model_name', 'generation_name', 'version_name'
