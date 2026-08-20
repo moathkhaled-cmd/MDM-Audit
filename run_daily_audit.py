@@ -19,6 +19,27 @@
 #      picks up exactly where today's left off, same as the Colab version.
 # ============================================================================
 
+# ============================================================================
+# ArabWheels AE — MDM Spec Audit (GitHub Actions daily runner — Gemini)
+# ============================================================================
+# Same audit logic as the Colab version, but every file read/write goes
+# through the Drive API (via drive_utils.py) instead of a local mounted
+# filesystem, since GitHub Actions runners don't have Drive mounted.
+#
+# Each run:
+#   1. Downloads the CSV from Drive (the audited one if it already exists
+#      there, otherwise the original).
+#   2. Lists every PDF under your brochures folder (metadata only — no PDF
+#      bytes downloaded yet) and re-runs matching fresh every time (cheap,
+#      local, and keeps things correct across the Colab -> Actions switch).
+#   3. Processes brochure groups until DAILY_REQUEST_CAP is hit or the queue
+#      is empty, downloading only the PDFs it actually needs to read today.
+#   4. Uploads the updated CSV, highlighted .xlsx, discrepancy/new-trim
+#      reports, audit log, and progress snapshot back to the SAME Drive
+#      folder, overwriting the previous version of each — so tomorrow's run
+#      picks up exactly where today's left off, same as the Colab version.
+# ============================================================================
+
 import os
 import re
 import io
@@ -32,7 +53,8 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import pypdf
-from openai import OpenAI
+from google import genai
+from google.genai import types
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -62,31 +84,33 @@ os.makedirs(LOCAL_DIR, exist_ok=True)
 def local(name):
     return os.path.join(LOCAL_DIR, name)
 
-OPENROUTER_API_KEY = os.environ['OPENROUTER_API_KEY']
-client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
+GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Free-model roster on OpenRouter rotates — verify this ID is still live and
-# still tagged :free at https://openrouter.ai/models before relying on it.
-MODEL_NAME = os.environ.get('OPENROUTER_MODEL', 'meta-llama/llama-4-maverick:free')
+MODEL_NAME = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
 
 MAX_TEXT_CHARS = 40_000
 GROUP_BATCH_SIZE = 10
 SAVE_EVERY_N_GROUPS = 5
 MAX_RETRIES = 5
 
-RATE_LIMIT_RPM = 18
+# Free-tier Gemini Flash is typically ~10-15 RPM depending on your account —
+# check https://ai.google.dev/gemini-api/docs/rate-limits and set this to
+# roughly 80% of your actual limit.
+RATE_LIMIT_RPM = int(os.environ.get('RATE_LIMIT_RPM', '10'))
 SLEEP_BETWEEN_REQUESTS = 60.0 / RATE_LIMIT_RPM
 
 # This is what makes it a genuine daily partition: each GitHub Actions run
 # does at most this many requests, then stops cleanly and picks back up on
-# tomorrow's scheduled run. 50/day fresh account, 1,000/day forever once
-# you've ever added $10 of OpenRouter credit.
-DAILY_REQUEST_CAP = int(os.environ.get('DAILY_REQUEST_CAP', '50'))
+# tomorrow's scheduled run. Gemini free tier is also capped per-day (varies
+# by model/account) — set this to comfortably under your actual daily quota.
+DAILY_REQUEST_CAP = int(os.environ.get('DAILY_REQUEST_CAP', '100'))
 
 MAKE_COL, MODEL_COL, GEN_COL, VERSION_COL = (
     'manufacturer_name', 'model_name', 'generation_name', 'version_name'
 )
 ID_COL = 'version_spec_id'
+
 
 BINARY_SPECS = [
     'air_conditioner', 'power_windows', 'power_door_locks', 'power_steering',
@@ -333,32 +357,70 @@ def extract_pdf_text(vpath: str) -> str:
     _pdf_text_cache[vpath] = full_text
     return full_text
 
-# ============================ OPENROUTER API CALL ============================
+# ============================ GEMINI API CALL ================================
 
 SYSTEM_INSTRUCTION = """
-You are an automotive spec auditor. You MUST return ONLY valid JSON in the exact structure requested,
-with no markdown code fences and no commentary before or after the JSON.
-Do not assume the current flags/specs given to you are correct — some are known to be wrong
-(e.g. a car marked as having a sunroof it doesn't, or missing a radio it actually has). Re-derive
-every binary flag and spec value yourself from the brochure text.
-Structure:
-{
-  "results": [
-    {
-      "version_spec_id": "string",
-      "brochure_covers_this_version": boolean,
-      "verified_flags": {"spec_name": 1_or_0, ... one entry for EVERY spec_name given in current_binary_flags},
-      "discrepancies": ["string"],
-      "spec_discrepancies": [
-         {"field": "string", "current_value": "string", "brochure_value": "string", "page_reference": "string"}
-      ]
-    }
-  ],
-  "missing_trims_in_brochure": [
-    {"trim_name": "string", "key_specs": {"spec_name": "string"}, "page_reference": "string"}
-  ]
-}
+You are an automotive spec auditor. Do not assume the current flags/specs given to you are
+correct — some are known to be wrong (e.g. a car marked as having a sunroof it doesn't, or
+missing a radio it actually has). Re-derive every binary flag and spec value yourself from the
+brochure text. Only report a spec_discrepancy when the brochure clearly states a different value
+(ignore trivial rounding/unit-notation differences). Only report a missing trim when confident
+it's genuinely absent from the KNOWN TRIMS list given to you.
 """
+
+# Native structured output — Gemini enforces this shape server-side, so no
+# markdown-fence stripping or "please return only JSON" prompting needed.
+SPEC_DISCREPANCY_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "field": types.Schema(type=types.Type.STRING),
+        "current_value": types.Schema(type=types.Type.STRING),
+        "brochure_value": types.Schema(type=types.Type.STRING),
+        "page_reference": types.Schema(type=types.Type.STRING),
+    },
+    required=["field", "current_value", "brochure_value"],
+)
+RESULT_ITEM_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "version_spec_id": types.Schema(type=types.Type.STRING),
+        "brochure_covers_this_version": types.Schema(type=types.Type.BOOLEAN),
+        "detected_brochure_model": types.Schema(type=types.Type.STRING),
+        "verified_flags": types.Schema(
+            type=types.Type.OBJECT,
+            properties={spec: types.Schema(type=types.Type.INTEGER) for spec in BINARY_SPECS},
+            required=list(BINARY_SPECS),
+        ),
+        "discrepancies": types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING)),
+        "spec_discrepancies": types.Schema(type=types.Type.ARRAY, items=SPEC_DISCREPANCY_SCHEMA),
+    },
+    required=["version_spec_id", "brochure_covers_this_version", "verified_flags", "discrepancies"],
+)
+MISSING_TRIM_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "trim_name": types.Schema(type=types.Type.STRING),
+        "key_specs": types.Schema(type=types.Type.OBJECT, properties={
+            f: types.Schema(type=types.Type.STRING) for f in (NUMERIC_SPECS + TEXT_SPECS)
+        }),
+        "page_reference": types.Schema(type=types.Type.STRING),
+    },
+    required=["trim_name"],
+)
+RESPONSE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "results": types.Schema(type=types.Type.ARRAY, items=RESULT_ITEM_SCHEMA),
+        "missing_trims_in_brochure": types.Schema(type=types.Type.ARRAY, items=MISSING_TRIM_SCHEMA),
+    },
+    required=["results"],
+)
+GEN_CONFIG = types.GenerateContentConfig(
+    system_instruction=SYSTEM_INSTRUCTION,
+    response_mime_type="application/json",
+    response_schema=RESPONSE_SCHEMA,
+    temperature=0,
+)
 
 def parse_retry_delay_seconds(err_msg: str):
     m = re.search(r'retryDelay["\']?\s*[:=]\s*["\']?(\d+(?:\.\d+)?)s', err_msg)
@@ -369,40 +431,33 @@ def parse_retry_delay_seconds(err_msg: str):
         return float(m.group(1))
     return None
 
-def call_openrouter_with_retry(system_prompt: str, user_prompt: str):
+def call_gemini_with_retry(user_prompt: str):
     for attempt in range(MAX_RETRIES):
         if not daily_cap_try_consume():
             return None, f"Daily request cap ({DAILY_REQUEST_CAP}) reached — stopping for today."
         try:
             time.sleep(SLEEP_BETWEEN_REQUESTS)
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
-            return response.choices[0].message.content, None
+            response = client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=GEN_CONFIG)
+            return response.text, None
         except Exception as e:
             msg = str(e)
-            if "rate limit" in msg.lower() and "day" in msg.lower():
-                return None, f"OpenRouter Daily Quota Error: {msg[:300]}"
-            if "429" in msg or "quota" in msg.lower() or "rate" in msg.lower():
+            is_daily_quota = "PerDay" in msg or "daily" in msg.lower()
+            if is_daily_quota:
+                return None, f"Gemini Daily Quota Error: {msg[:300]}"
+            if any(code in msg for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
                 delay = parse_retry_delay_seconds(msg)
                 if delay is None:
                     delay = (2 ** (attempt + 1)) + random.uniform(1, 2)
                 print(f"[Rate Limit] attempt {attempt + 1}/{MAX_RETRIES}, waiting {delay:.1f}s...")
                 time.sleep(delay)
             else:
-                return None, f"OpenRouter API Error: {msg}"
-    return None, "OpenRouter API Error: Exceeded Retries"
+                return None, f"Gemini API Error: {msg}"
+    return None, "Gemini API Error: Exceeded Retries"
 
 def normalize_trim_key(name):
     return re.sub(r'[^a-z0-9]', '', str(name).lower())
 
-def audit_group_openrouter(make, model, generation, pdf_text, group_rows):
+def audit_group_gemini(make, model, generation, pdf_text, group_rows):
     all_results = []
     all_missing_trims = []
     all_version_names = [str(row.get(VERSION_COL, '')) for _, row in group_rows]
@@ -428,7 +483,7 @@ KNOWN TRIMS: {json.dumps(all_version_names)}
 BROCHURE TEXT:
 {pdf_text}
 """
-        res_text, err = call_openrouter_with_retry(SYSTEM_INSTRUCTION, user_prompt)
+        res_text, err = call_gemini_with_retry(user_prompt)
 
         if err or not res_text:
             for idx, row in batch:
@@ -436,8 +491,7 @@ BROCHURE TEXT:
             continue
 
         try:
-            cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', res_text.strip())
-            parsed = json.loads(cleaned)
+            parsed = json.loads(res_text)
             all_results.extend(parsed.get("results", []))
             all_missing_trims.extend(parsed.get("missing_trims_in_brochure", []))
         except Exception as parse_err:
@@ -540,7 +594,7 @@ def run_pipeline():
             continue
 
         first_row = g_rows[0][1]
-        results, missing_trims = audit_group_openrouter(
+        results, missing_trims = audit_group_gemini(
             first_row.get(MAKE_COL), first_row.get(MODEL_COL), first_row.get(GEN_COL), pdf_text, g_rows
         )
 
