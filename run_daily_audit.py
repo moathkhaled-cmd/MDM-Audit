@@ -222,7 +222,11 @@ def log_event(payload: dict):
 # ============================== DRIVE SETUP =================================
 
 print("Authenticating to Google Drive...")
-drive = drive_utils.get_drive_service()
+drive, service_account_email = drive_utils.get_drive_service()
+
+print("Checking folder access...")
+drive_utils.check_folder_access(drive, GDRIVE_ROOT_FOLDER_ID, "GDRIVE_ROOT_FOLDER_ID", service_account_email)
+drive_utils.check_folder_access(drive, GDRIVE_BROCHURES_FOLDER_ID, "GDRIVE_BROCHURES_FOLDER_ID", service_account_email)
 
 existing_output_id = drive_utils.find_file_id_by_name(drive, GDRIVE_ROOT_FOLDER_ID, OUTPUT_CSV_NAME)
 if existing_output_id:
