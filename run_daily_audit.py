@@ -241,7 +241,8 @@ else:
     drive_utils.download_to_path(drive, source_id, local(SOURCE_CSV_NAME))
     df = pd.read_csv(local(SOURCE_CSV_NAME), low_memory=False)
 
-for col in ['Brochure_File_Found', 'Matched_Brochure_Path', 'Accuracy_Status', 'Discrepancies_Flagged', 'Match_Confidence']:
+for col in ['Brochure_File_Found', 'Matched_Brochure_Path', 'Accuracy_Status', 'Discrepancies_Flagged',
+            'Match_Confidence', 'Audit_Source', 'Audit_Progress']:
     if col not in df.columns:
         df[col] = False if col == 'Brochure_File_Found' else ""
 
@@ -408,12 +409,24 @@ def extract_pdf_text(vpath: str) -> str:
 # ============================ GEMINI API CALL ================================
 
 SYSTEM_INSTRUCTION = """
-You are an automotive spec auditor. Do not assume the current flags/specs given to you are
-correct — some are known to be wrong (e.g. a car marked as having a sunroof it doesn't, or
-missing a radio it actually has). Re-derive every binary flag and spec value yourself from the
-brochure text. Only report a spec_discrepancy when the brochure clearly states a different value
-(ignore trivial rounding/unit-notation differences). Only report a missing trim when confident
-it's genuinely absent from the KNOWN TRIMS list given to you.
+You are an automotive spec auditor. Be precise and literal. Never guess, assume, or invent a
+value that isn't stated in the source text given to you.
+
+Do not trust the current flags/specs given to you as correct — some are known to be wrong.
+Re-derive every binary flag and spec value yourself from the source text only.
+
+For every binary flag, reply with EXACTLY one of these three characters, nothing else:
+  "1" = the source text explicitly confirms this trim HAS this feature.
+  "0" = the source text explicitly confirms this trim does NOT have this feature
+        (states it as unavailable, not fitted, "-", or "N/A" for this specific trim).
+  "U" = the source text does not clearly state either way for this specific trim.
+        Use "U" whenever you are not certain — never guess "0" just because a feature
+        isn't mentioned. Absence of mention is NOT the same as absence of the feature.
+
+Only report a spec_discrepancy when the source clearly states a different value than the
+current one (ignore trivial rounding/unit-notation differences). Only report a missing trim
+when confident it's genuinely absent from the KNOWN TRIMS list given to you. Keep every text
+field short and factual — no commentary, no explanations beyond what's requested.
 """
 
 # Native structured output — Gemini enforces this shape server-side, so no
@@ -436,7 +449,10 @@ RESULT_ITEM_SCHEMA = types.Schema(
         "detected_brochure_model": types.Schema(type=types.Type.STRING),
         "verified_flags": types.Schema(
             type=types.Type.OBJECT,
-            properties={spec: types.Schema(type=types.Type.INTEGER) for spec in BINARY_SPECS},
+            properties={
+                spec: types.Schema(type=types.Type.STRING, enum=["0", "1", "U"])
+                for spec in BINARY_SPECS
+            },
             required=list(BINARY_SPECS),
         ),
         "discrepancies": types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING)),
@@ -469,6 +485,44 @@ GEN_CONFIG = types.GenerateContentConfig(
     response_schema=RESPONSE_SCHEMA,
     temperature=0,
 )
+
+# Used only for the no-brochure fallback: Gemini's Google Search grounding
+# tool cannot be combined with response_schema/JSON mode in a single call, so
+# this is a plain-text grounded search step; its output is then fed into a
+# second, normal call using GEN_CONFIG above for structured extraction.
+WEB_SEARCH_SYSTEM_INSTRUCTION = """
+You are researching official automotive specifications. Search for the manufacturer's own
+official website and official regional (UAE/GCC) brochure or spec page for the exact
+make/model/trim given. Only use official manufacturer sources; a reputable regional dealer
+page is acceptable only if no official manufacturer page is found. Report only what you
+actually find, with the source for each fact. Never guess, estimate, or fill in a plausible-
+sounding value. If you cannot find a fact from a real source, say so explicitly rather than
+omitting it silently. Keep the report factual and concise -- specs and features only, no
+marketing language.
+"""
+WEB_SEARCH_CONFIG = types.GenerateContentConfig(
+    system_instruction=WEB_SEARCH_SYSTEM_INSTRUCTION,
+    tools=[types.Tool(google_search=types.GoogleSearch())],
+    temperature=0,
+)
+
+def call_gemini_web_search_with_retry(user_prompt: str):
+    for attempt in range(MAX_RETRIES):
+        if not daily_cap_try_consume():
+            return None, f"Daily request cap ({DAILY_REQUEST_CAP}) reached — stopping for today."
+        try:
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+            response = client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=WEB_SEARCH_CONFIG)
+            return response.text, None
+        except Exception as e:
+            msg = str(e)
+            if any(code in msg for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
+                delay = parse_retry_delay_seconds(msg) or ((2 ** (attempt + 1)) + random.uniform(1, 2))
+                print(f"[Rate Limit - web search] attempt {attempt + 1}/{MAX_RETRIES}, waiting {delay:.1f}s...")
+                time.sleep(delay)
+            else:
+                return None, f"Gemini Web Search Error: {msg}"
+    return None, "Gemini Web Search Error: Exceeded Retries"
 
 def parse_retry_delay_seconds(err_msg: str):
     m = re.search(r'retryDelay["\']?\s*[:=]\s*["\']?(\d+(?:\.\d+)?)s', err_msg)
@@ -505,7 +559,12 @@ def call_gemini_with_retry(user_prompt: str):
 def normalize_trim_key(name):
     return re.sub(r'[^a-z0-9]', '', str(name).lower())
 
-def audit_group_gemini(make, model, generation, pdf_text, group_rows, match_confidence='Exact'):
+def _extract_specs_from_text(make, model, generation, source_text, group_rows, extra_prompt_note=""):
+    """Shared structured-extraction step: given free text (brochure OR grounded
+    web-search text) and a group of sheet rows for one vehicle, batches the
+    rows and asks Gemini to re-derive specs using GEN_CONFIG's schema. Used by
+    both the brochure path and the no-brochure web-search fallback so the
+    extraction logic and output shape are identical either way."""
     all_results = []
     all_missing_trims = []
     all_version_names = [str(row.get(VERSION_COL, '')) for _, row in group_rows]
@@ -523,25 +582,13 @@ def audit_group_gemini(make, model, generation, pdf_text, group_rows, match_conf
                 "current_specs": current_specs
             })
 
-        confidence_note = ""
-        if match_confidence == "Model-Only":
-            confidence_note = (
-                "\nMATCH CONFIDENCE: Model-Only. This brochure's filename did not contain the "
-                "manufacturer name, so it was matched by model name/code alone. Model codes "
-                "(e.g. H9, S7, T5) are sometimes reused across different brands. Before "
-                "reporting any spec, first confirm from the BROCHURE TEXT itself that the "
-                f"manufacturer is actually '{make}' and the model is '{model}'. If the brochure "
-                "text shows a different manufacturer than expected, set "
-                "brochure_covers_this_version to false instead of reporting specs.\n"
-            )
-
         user_prompt = f"""
 VEHICLE: {make} {model} ({generation})
-{confidence_note}VERSIONS: {json.dumps(versions_payload)}
+{extra_prompt_note}VERSIONS: {json.dumps(versions_payload)}
 KNOWN TRIMS: {json.dumps(all_version_names)}
 
-BROCHURE TEXT:
-{pdf_text}
+SOURCE TEXT:
+{source_text}
 """
         res_text, err = call_gemini_with_retry(user_prompt)
 
@@ -560,7 +607,53 @@ BROCHURE TEXT:
 
     return all_results, all_missing_trims
 
-def make_new_row_from_trim(sample_row, vpath, trim):
+
+def audit_group_gemini(make, model, generation, pdf_text, group_rows, match_confidence='Exact'):
+    confidence_note = ""
+    if match_confidence == "Model-Only":
+        confidence_note = (
+            "\nMATCH CONFIDENCE: Model-Only. This brochure's filename did not contain the "
+            "manufacturer name, so it was matched by model name/code alone. Model codes "
+            "(e.g. H9, S7, T5) are sometimes reused across different brands. Before "
+            "reporting any spec, first confirm from the SOURCE TEXT itself that the "
+            f"manufacturer is actually '{make}' and the model is '{model}'. If the source "
+            "text shows a different manufacturer than expected, set "
+            "brochure_covers_this_version to false instead of reporting specs.\n"
+        )
+    return _extract_specs_from_text(make, model, generation, pdf_text, group_rows, confidence_note)
+
+
+def audit_group_web_search(make, model, generation, group_rows):
+    """No-brochure fallback: gathers real spec info via Gemini's Google Search
+    grounding tool from official manufacturer sources, then runs the exact
+    same structured extraction as the brochure path on that grounded text.
+    Two Gemini calls per group (search + extract), both counted against the
+    daily cap."""
+    all_version_names = [str(row.get(VERSION_COL, '')) for _, row in group_rows]
+    search_prompt = f"""
+Find official specifications for this vehicle: {make} {model} ({generation}).
+Trims/versions to cover: {json.dumps(all_version_names)}
+
+For each trim, report: which of these features it has or lacks (only state ones you can
+confirm from a real source): {", ".join(BINARY_SPECS)}.
+Also report any of these specs you can confirm: {", ".join(NUMERIC_SPECS + TEXT_SPECS)}.
+
+Cite the source (official manufacturer page or dealer page) for each fact. If you cannot find
+reliable information for a trim, say so plainly instead of guessing.
+"""
+    grounded_text, err = call_gemini_web_search_with_retry(search_prompt)
+    if err or not grounded_text or not grounded_text.strip():
+        return [{"version_spec_id": str(row.get(ID_COL, idx)), "error": err or "Web search returned no text"}
+                for idx, row in group_rows], []
+
+    web_note = (
+        "\nSOURCE: This text was gathered via web search (no manufacturer brochure PDF was "
+        "available for this vehicle). Apply the same 0/1/U discipline -- if the web search text "
+        "doesn't clearly confirm a feature for a specific trim, answer U, don't guess.\n"
+    )
+    return _extract_specs_from_text(make, model, generation, grounded_text, group_rows, web_note)
+
+
     trim_name = trim.get("trim_name", "").strip()
     if not trim_name:
         return None
@@ -604,17 +697,27 @@ def write_progress_snapshot(status, groups_done, groups_total, extra=None):
     return snapshot
 
 def report_unaudited_rows():
-    pending_mask = (
-        (df['Brochure_File_Found'] == True)
-        & (df['Matched_Brochure_Path'].astype(str).str.len() > 0)
-        & (~df['Accuracy_Status'].isin(TERMINAL_STATUSES))
-    )
-    pending = df.loc[pending_mask]
+    pending = df.loc[df['Audit_Progress'] == "Pending"]
     if len(pending):
         cols = [c for c in [ID_COL, MAKE_COL, MODEL_COL, GEN_COL, VERSION_COL,
                              'Matched_Brochure_Path', 'Accuracy_Status'] if c in df.columns]
         pending[cols].to_csv(local(NOT_YET_AUDITED_NAME), index=False)
     return len(pending)
+
+# Statuses that mean "hasn't actually been looked at by the AI yet" -- either
+# still queued, or blocked on a data problem (bad make/model, ambiguous
+# match) that no amount of auditing can resolve until the sheet itself is
+# fixed. Everything else means some audit path (brochure or web search)
+# actually ran and produced a real outcome.
+NOT_YET_AUDITED_STATUSES = {
+    "", "Flagged: Missing Brochure PDF", "Flagged: Missing Make/Model in Sheet",
+    "Flagged: Ambiguous Brochure Match",
+}
+
+def refresh_audit_progress():
+    df['Audit_Progress'] = df['Accuracy_Status'].apply(
+        lambda s: "Pending" if (pd.isna(s) or s in NOT_YET_AUDITED_STATUSES) else "Audited"
+    )
 
 def upload_outputs():
     for fname in [OUTPUT_CSV_NAME, OUTPUT_XLSX_HIGHLIGHTED_NAME, DISCREPANCY_DETAIL_NAME,
@@ -623,6 +726,93 @@ def upload_outputs():
         if os.path.exists(path):
             drive_utils.upload_or_update(drive, GDRIVE_ROOT_FOLDER_ID, path, remote_name=fname)
             print(f"  Uploaded {fname} to Drive.")
+
+def run_pipeline():
+    matched_df = df[(df['Brochure_File_Found'] == True) & (df['Matched_Brochure_Path'].astype(str).str.len() > 0)]
+    to_process = [idx for idx, row in matched_df.iterrows() if row.get('Accuracy_Status') not in TERMINAL_STATUSES]
+
+    grouped_by_pdf = {}
+    for idx in to_process:
+        vpath = df.at[idx, 'Matched_Brochure_Path']
+        grouped_by_pdf.setdefault(vpath, []).append((idx, df.loc[idx]))
+
+    total_groups = len(grouped_by_pdf)
+    print(f"Total brochure groups pending: {total_groups} "
+          f"(today's cap: {DAILY_REQUEST_CAP} requests, ~{DAILY_REQUEST_CAP // GROUP_BATCH_SIZE if GROUP_BATCH_SIZE else DAILY_REQUEST_CAP} "
+          f"group(s) worth, depending on trims per brochure)")
+
+def apply_audit_result(idx, row, res, source_vpath, source_label):
+    """Applies one Gemini result to one sheet row and sets bookkeeping columns.
+    source_label is 'Brochure' or 'Web Search (No Brochure)' -- written to
+    Audit_Source so every row's provenance is visible in the sheet, and,
+    for the no-brochure case, prepended to Discrepancies_Flagged so it reads
+    plainly even without checking the Audit_Source column."""
+    v_id = str(row.get(ID_COL, idx))
+    df.at[idx, 'Audit_Source'] = source_label
+    no_brochure_note = "No brochure available — audited via AI web search (official sources). " \
+        if source_label != "Brochure" else ""
+
+    if res.get('error'):
+        df.at[idx, 'Accuracy_Status'] = res['error']
+        log_event({"version_spec_id": v_id, "status": "error", "detail": res['error'], "source": source_vpath})
+        return
+
+    if not res.get('brochure_covers_this_version', True):
+        df.at[idx, 'Accuracy_Status'] = "Flagged: Mismatched Brochure PDF"
+        log_event({"version_spec_id": v_id, "status": "mismatched_brochure", "source": source_vpath})
+        return
+
+    verified_flags = res.get('verified_flags', {}) or {}
+    spec_discrepancies = res.get('spec_discrepancies', []) or []
+    row_changes = []
+
+    for spec_col, val in verified_flags.items():
+        if spec_col not in BINARY_SPECS or spec_col not in df.columns:
+            continue
+        val_str = str(val).strip().upper()
+        if val_str not in ("0", "1"):
+            continue  # 'U' (or anything unexpected) -- source didn't clearly say either
+                      # way for this trim; leave the existing value untouched rather
+                      # than overwrite it with a guess.
+        new_val = int(val_str)
+        old_val = df.at[idx, spec_col]
+        if values_differ(old_val, new_val):
+            row_changes.append((spec_col, old_val, new_val, ''))
+            CHANGED_CELLS[(idx, spec_col)] = True
+        df.at[idx, spec_col] = new_val
+
+    for sd in spec_discrepancies:
+        field = sd.get('field', '')
+        brochure_val = sd.get('brochure_value', '')
+        page_ref = sd.get('page_reference', '')
+        if not field or field not in df.columns or brochure_val in (None, ''):
+            continue
+        old_val = df.at[idx, field]
+        if values_differ(old_val, brochure_val):
+            row_changes.append((field, old_val, brochure_val, page_ref))
+            CHANGED_CELLS[(idx, field)] = True
+            df.at[idx, field] = brochure_val
+        with _detail_lock:
+            spec_discrepancy_details.append({
+                ID_COL: v_id, MAKE_COL: row.get(MAKE_COL, ''), MODEL_COL: row.get(MODEL_COL, ''),
+                VERSION_COL: row.get(VERSION_COL, ''), 'field': field, 'current_value': old_val,
+                'brochure_value': brochure_val, 'page_reference': page_ref, 'source': source_vpath,
+            })
+
+    if row_changes:
+        df.at[idx, 'Accuracy_Status'] = "Flagged: Spec Discrepancy"
+        issue_parts = [f"{c}: {o} → {n}" + (f" (Page {p})" if p else "") for c, o, n, p in row_changes]
+        df.at[idx, 'Discrepancies_Flagged'] = no_brochure_note + " | ".join(issue_parts)
+    else:
+        df.at[idx, 'Accuracy_Status'] = "Verified Accurate"
+        df.at[idx, 'Discrepancies_Flagged'] = no_brochure_note + "No issues found — matches source."
+
+    log_event({
+        "version_spec_id": v_id, "status": df.at[idx, 'Accuracy_Status'],
+        "changes": [{"field": c[0], "old": str(c[1]), "new": str(c[2]), "page": c[3]} for c in row_changes],
+        "source": source_vpath,
+    })
+
 
 def run_pipeline():
     matched_df = df[(df['Brochure_File_Found'] == True) & (df['Matched_Brochure_Path'].astype(str).str.len() > 0)]
@@ -651,6 +841,7 @@ def run_pipeline():
         if not pdf_text.strip():
             for idx, _ in g_rows:
                 df.at[idx, 'Accuracy_Status'] = "Flagged: Image-Only or Unreadable PDF"
+                df.at[idx, 'Audit_Source'] = "Brochure"
             continue
 
         first_row = g_rows[0][1]
@@ -671,65 +862,7 @@ def run_pipeline():
         for idx, row in g_rows:
             v_id = str(row.get(ID_COL, idx))
             res = res_map.get(v_id, {})
-
-            if res.get('error'):
-                df.at[idx, 'Accuracy_Status'] = res['error']
-                log_event({"version_spec_id": v_id, "status": "error", "detail": res['error'], "brochure": vpath})
-                continue
-
-            if not res.get('brochure_covers_this_version', True):
-                df.at[idx, 'Accuracy_Status'] = "Flagged: Mismatched Brochure PDF"
-                log_event({"version_spec_id": v_id, "status": "mismatched_brochure", "brochure": vpath})
-                continue
-
-            verified_flags = res.get('verified_flags', {}) or {}
-            spec_discrepancies = res.get('spec_discrepancies', []) or []
-            row_changes = []
-
-            for spec_col, val in verified_flags.items():
-                if spec_col not in BINARY_SPECS or spec_col not in df.columns:
-                    continue
-                try:
-                    new_val = 1 if int(val) != 0 else 0
-                except (ValueError, TypeError):
-                    continue
-                old_val = df.at[idx, spec_col]
-                if values_differ(old_val, new_val):
-                    row_changes.append((spec_col, old_val, new_val, ''))
-                    CHANGED_CELLS[(idx, spec_col)] = True
-                df.at[idx, spec_col] = new_val
-
-            for sd in spec_discrepancies:
-                field = sd.get('field', '')
-                brochure_val = sd.get('brochure_value', '')
-                page_ref = sd.get('page_reference', '')
-                if not field or field not in df.columns or brochure_val in (None, ''):
-                    continue
-                old_val = df.at[idx, field]
-                if values_differ(old_val, brochure_val):
-                    row_changes.append((field, old_val, brochure_val, page_ref))
-                    CHANGED_CELLS[(idx, field)] = True
-                    df.at[idx, field] = brochure_val
-                with _detail_lock:
-                    spec_discrepancy_details.append({
-                        ID_COL: v_id, MAKE_COL: row.get(MAKE_COL, ''), MODEL_COL: row.get(MODEL_COL, ''),
-                        VERSION_COL: row.get(VERSION_COL, ''), 'field': field, 'current_value': old_val,
-                        'brochure_value': brochure_val, 'page_reference': page_ref, 'brochure_path': vpath,
-                    })
-
-            if row_changes:
-                df.at[idx, 'Accuracy_Status'] = "Flagged: Spec Discrepancy"
-                issue_parts = [f"{c}: {o} → {n}" + (f" (Page {p})" if p else "") for c, o, n, p in row_changes]
-                df.at[idx, 'Discrepancies_Flagged'] = " | ".join(issue_parts)
-            else:
-                df.at[idx, 'Accuracy_Status'] = "Verified Accurate"
-                df.at[idx, 'Discrepancies_Flagged'] = "No issues found — matches brochure."
-
-            log_event({
-                "version_spec_id": v_id, "status": df.at[idx, 'Accuracy_Status'],
-                "changes": [{"field": c[0], "old": str(c[1]), "new": str(c[2]), "page": c[3]} for c in row_changes],
-                "brochure": vpath,
-            })
+            apply_audit_result(idx, row, res, vpath, "Brochure")
 
         group_count += 1
         if group_count % SAVE_EVERY_N_GROUPS == 0:
@@ -738,7 +871,43 @@ def run_pipeline():
             upload_outputs()
             print(f"[{group_count}/{total_groups}] groups done, checkpoint uploaded to Drive.")
 
+    # --- No-brochure fallback: audit via web search instead of leaving these
+    # rows permanently unaudited, as long as daily cap budget remains. ---
+    no_brochure_df = df[df['Accuracy_Status'] == "Flagged: Missing Brochure PDF"]
+    grouped_by_vehicle = {}
+    for idx, row in no_brochure_df.iterrows():
+        key = (row.get(MAKE_COL), row.get(MODEL_COL), row.get(GEN_COL))
+        grouped_by_vehicle.setdefault(key, []).append((idx, df.loc[idx]))
+
+    total_web_groups = len(grouped_by_vehicle)
+    if total_web_groups:
+        print(f"\n{total_web_groups} vehicle(s) with no brochure at all — "
+              f"attempting web-search fallback for as many as today's remaining cap allows.")
+
+    web_group_count = 0
+    for (make, model, gen), g_rows in grouped_by_vehicle.items():
+        if daily_cap_exhausted():
+            print(f"\nDaily request cap reached during web-search fallback — remaining "
+                  f"no-brochure vehicles will be attempted on a future run.")
+            stopped_early = True
+            break
+
+        results, _ = audit_group_web_search(make, model, gen, g_rows)
+        res_map = {str(r.get('version_spec_id')): r for r in results if 'version_spec_id' in r}
+
+        for idx, row in g_rows:
+            v_id = str(row.get(ID_COL, idx))
+            res = res_map.get(v_id, {})
+            apply_audit_result(idx, row, res, f"web_search:{make}/{model}", "Web Search (No Brochure)")
+
+        web_group_count += 1
+        if web_group_count % SAVE_EVERY_N_GROUPS == 0:
+            df.to_csv(local(OUTPUT_CSV_NAME), index=False)
+            upload_outputs()
+            print(f"[web search {web_group_count}/{total_web_groups}] vehicles done, checkpoint uploaded to Drive.")
+
     df.to_csv(local(OUTPUT_CSV_NAME), index=False)
+    refresh_audit_progress()
 
     unaudited_count = report_unaudited_rows()
     write_progress_snapshot(
@@ -746,14 +915,28 @@ def run_pipeline():
         group_count, total_groups, {"rows_still_unaudited": int(unaudited_count)},
     )
 
-    if CHANGED_CELLS:
+    if CHANGED_CELLS or (df['Audit_Source'] == "Web Search (No Brochure)").any():
         df.to_excel(local(OUTPUT_XLSX_HIGHLIGHTED_NAME), index=False, sheet_name='Audited', engine='openpyxl')
         import openpyxl
         wb = openpyxl.load_workbook(local(OUTPUT_XLSX_HIGHLIGHTED_NAME))
         ws = wb['Audited']
         red_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+        yellow_fill = PatternFill(start_color='FFF9C4', end_color='FFF9C4', fill_type='solid')
         col_positions = {name: i + 1 for i, name in enumerate(df.columns)}
         row_positions = {label: pos for pos, label in enumerate(df.index)}
+
+        # Yellow first: whole row, for anything audited without a brochure.
+        web_search_rows = df.index[df['Audit_Source'] == "Web Search (No Brochure)"]
+        for row_idx in web_search_rows:
+            if row_idx not in row_positions:
+                continue
+            excel_row = row_positions[row_idx] + 2
+            for col_pos in range(1, len(df.columns) + 1):
+                ws[f'{get_column_letter(col_pos)}{excel_row}'].fill = yellow_fill
+
+        # Red second, on top: individually corrected cells take priority over
+        # the row-level yellow so a changed value is never mistaken for an
+        # unchanged-but-web-sourced one.
         for (row_idx, col_name), _ in CHANGED_CELLS.items():
             if col_name not in col_positions or row_idx not in row_positions:
                 continue
@@ -761,7 +944,8 @@ def run_pipeline():
             excel_col_letter = get_column_letter(col_positions[col_name])
             ws[f'{excel_col_letter}{excel_row}'].fill = red_fill
         wb.save(local(OUTPUT_XLSX_HIGHLIGHTED_NAME))
-        print(f"Highlighted {len(CHANGED_CELLS)} corrected cell(s) red in {OUTPUT_XLSX_HIGHLIGHTED_NAME}")
+        print(f"Highlighted {len(CHANGED_CELLS)} corrected cell(s) red, "
+              f"{len(web_search_rows)} no-brochure row(s) yellow in {OUTPUT_XLSX_HIGHLIGHTED_NAME}")
 
     if spec_discrepancy_details:
         pd.DataFrame(spec_discrepancy_details).to_csv(local(DISCREPANCY_DETAIL_NAME), index=False)
@@ -769,7 +953,13 @@ def run_pipeline():
         pd.DataFrame(new_rows_from_brochures).to_csv(local(NEW_TRIMS_NAME), index=False)
 
     summary_counts = df['Accuracy_Status'].value_counts(dropna=False)
-    summary_lines = ["AUDIT SUMMARY", "=" * 40] + [f"{s or '(unaudited)'}: {c}" for s, c in summary_counts.items()]
+    progress_counts = df['Audit_Progress'].value_counts(dropna=False)
+    source_counts = df.loc[df['Audit_Source'] != "", 'Audit_Source'].value_counts(dropna=False)
+    summary_lines = ["AUDIT SUMMARY", "=" * 40]
+    summary_lines += [f"{p}: {c}" for p, c in progress_counts.items()]
+    summary_lines += ["", "By Accuracy_Status:"] + [f"  {s or '(unaudited)'}: {c}" for s, c in summary_counts.items()]
+    if len(source_counts):
+        summary_lines += ["", "By Audit_Source:"] + [f"  {s}: {c}" for s, c in source_counts.items()]
     summary_text = "\n".join(summary_lines)
     with open(local(SUMMARY_NAME), "w", encoding="utf-8") as f:
         f.write(summary_text)
