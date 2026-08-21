@@ -654,6 +654,98 @@ reliable information for a trim, say so plainly instead of guessing.
     return _extract_specs_from_text(make, model, generation, grounded_text, group_rows, web_note)
 
 
+def audit_group_web_crosscheck(make, model, generation, group_rows, unclear_by_idx):
+    """Targeted follow-up for brochure-audited rows: only the specific
+    features the brochure left as 'U' (unclear) for each trim get sent to a
+    web search, instead of re-auditing everything. Keeps the prompt small
+    and avoids the web search overwriting anything the brochure already
+    confirmed."""
+    per_trim_targets = {}
+    for idx, row in group_rows:
+        v_id = str(row.get(ID_COL, idx))
+        targets = sorted(unclear_by_idx.get(idx, set()))
+        if targets:
+            per_trim_targets[v_id] = {"version_name": str(row.get(VERSION_COL, '')), "features_to_check": targets}
+
+    if not per_trim_targets:
+        return {}
+
+    search_prompt = f"""
+Vehicle: {make} {model} ({generation}).
+For each trim below, confirm ONLY the specific listed features from an official manufacturer
+source (or a reputable dealer page if no official page exists). Do not report on any feature
+not listed for that trim.
+
+{json.dumps(per_trim_targets, indent=None)}
+
+For each trim, state clearly which listed features it HAS and which it does NOT have. If you
+cannot confirm a feature from a real source, say so plainly instead of guessing. Cite the
+source for each fact.
+"""
+    grounded_text, err = call_gemini_web_search_with_retry(search_prompt)
+    if err or not grounded_text or not grounded_text.strip():
+        return {}
+
+    # Reuse the same structured extraction as everywhere else, but scoped:
+    # ask only about the union of targeted features across this group, to
+    # keep the extraction call small too.
+    all_targets = sorted({f for t in per_trim_targets.values() for f in t["features_to_check"]})
+    web_note = (
+        "\nSOURCE: Web search results, scoped ONLY to these specific features that the "
+        f"original brochure did not clearly state: {', '.join(all_targets)}. For any other "
+        "field, reply U regardless of what you might know -- only these features were "
+        "actually researched for this pass.\n"
+    )
+    results, _ = _extract_specs_from_text(make, model, generation, grounded_text, group_rows, web_note)
+    return {str(r.get('version_spec_id')): r for r in results if 'version_spec_id' in r}
+
+
+def apply_crosscheck_result(idx, row, res, target_fields):
+    """Surgically merges cross-check results into a row that was already
+    fully processed by the brochure pass. Only touches fields in
+    target_fields (the ones that were actually 'U' after the brochure), and
+    never resets Accuracy_Status from scratch -- it appends to what the
+    brochure pass already decided rather than replacing it."""
+    if not res or res.get('error') or not res.get('brochure_covers_this_version', True):
+        return False
+
+    verified_flags = res.get('verified_flags', {}) or {}
+    filled, row_changes = [], []
+    for spec_col in target_fields:
+        val = verified_flags.get(spec_col)
+        if val is None or spec_col not in df.columns:
+            continue
+        val_str = str(val).strip().upper()
+        if val_str not in ("0", "1"):
+            continue  # still unclear even after web search -- leave untouched
+        new_val = int(val_str)
+        old_val = df.at[idx, spec_col]
+        if values_differ(old_val, new_val):
+            row_changes.append((spec_col, old_val, new_val))
+            CHANGED_CELLS[(idx, spec_col)] = True
+        df.at[idx, spec_col] = new_val
+        filled.append(spec_col)
+
+    if not filled:
+        return False
+
+    prior_source = df.at[idx, 'Audit_Source']
+    df.at[idx, 'Audit_Source'] = f"{prior_source} + Web Search (partial)" if prior_source else "Web Search (partial)"
+    fill_note = f"Web search confirmed {len(filled)} feature(s) not stated in brochure: " + ", ".join(
+        f"{c}={n}" for c, _, n in row_changes
+    )
+    prior_note = df.at[idx, 'Discrepancies_Flagged']
+    df.at[idx, 'Discrepancies_Flagged'] = (str(prior_note) + " | " + fill_note) if prior_note and str(prior_note).strip() else fill_note
+    if row_changes and df.at[idx, 'Accuracy_Status'] == "Verified Accurate":
+        df.at[idx, 'Accuracy_Status'] = "Flagged: Spec Discrepancy"
+    log_event({
+        "version_spec_id": str(row.get(ID_COL, idx)), "status": "crosscheck_fill",
+        "changes": [{"field": c, "old": str(o), "new": str(n)} for c, o, n in row_changes],
+    })
+    return True
+
+
+def make_new_row_from_trim(sample_row, vpath, trim):
     trim_name = trim.get("trim_name", "").strip()
     if not trim_name:
         return None
@@ -727,19 +819,7 @@ def upload_outputs():
             drive_utils.upload_or_update(drive, GDRIVE_ROOT_FOLDER_ID, path, remote_name=fname)
             print(f"  Uploaded {fname} to Drive.")
 
-def run_pipeline():
-    matched_df = df[(df['Brochure_File_Found'] == True) & (df['Matched_Brochure_Path'].astype(str).str.len() > 0)]
-    to_process = [idx for idx, row in matched_df.iterrows() if row.get('Accuracy_Status') not in TERMINAL_STATUSES]
-
-    grouped_by_pdf = {}
-    for idx in to_process:
-        vpath = df.at[idx, 'Matched_Brochure_Path']
-        grouped_by_pdf.setdefault(vpath, []).append((idx, df.loc[idx]))
-
-    total_groups = len(grouped_by_pdf)
-    print(f"Total brochure groups pending: {total_groups} "
-          f"(today's cap: {DAILY_REQUEST_CAP} requests, ~{DAILY_REQUEST_CAP // GROUP_BATCH_SIZE if GROUP_BATCH_SIZE else DAILY_REQUEST_CAP} "
-          f"group(s) worth, depending on trims per brochure)")
+UNCLEAR_SPECS_BY_ROW = {}  # idx -> set of BINARY_SPECS column names that came back 'U' from the brochure
 
 def apply_audit_result(idx, row, res, source_vpath, source_label):
     """Applies one Gemini result to one sheet row and sets bookkeeping columns.
@@ -771,6 +851,8 @@ def apply_audit_result(idx, row, res, source_vpath, source_label):
             continue
         val_str = str(val).strip().upper()
         if val_str not in ("0", "1"):
+            if val_str == "U" and source_label == "Brochure":
+                UNCLEAR_SPECS_BY_ROW.setdefault(idx, set()).add(spec_col)
             continue  # 'U' (or anything unexpected) -- source didn't clearly say either
                       # way for this trim; leave the existing value untouched rather
                       # than overwrite it with a guess.
@@ -870,6 +952,45 @@ def run_pipeline():
             write_progress_snapshot("in_progress", group_count, total_groups, {"last_brochure": vpath})
             upload_outputs()
             print(f"[{group_count}/{total_groups}] groups done, checkpoint uploaded to Drive.")
+
+    # --- Cross-check pass: for brochure-audited rows where specific features
+    # came back 'U' (not stated in the brochure), do one targeted web search
+    # per vehicle to try to confirm just those items -- keeps every row's
+    # data complete rather than permanently leaving gaps whenever a brochure
+    # is incomplete. ---
+    crosscheck_targets = {idx: fields for idx, fields in UNCLEAR_SPECS_BY_ROW.items() if fields}
+    if crosscheck_targets:
+        grouped_for_crosscheck = {}
+        for idx, fields in crosscheck_targets.items():
+            if idx not in df.index:
+                continue
+            row = df.loc[idx]
+            key = (row.get(MAKE_COL), row.get(MODEL_COL), row.get(GEN_COL))
+            grouped_for_crosscheck.setdefault(key, []).append((idx, row))
+
+        print(f"\n{len(crosscheck_targets)} row(s) had features the brochure didn't state — "
+              f"attempting a targeted web cross-check for as many as today's remaining cap allows.")
+        crosscheck_group_count = 0
+        for (make, model, gen), g_rows in grouped_for_crosscheck.items():
+            if daily_cap_exhausted():
+                print("\nDaily request cap reached during cross-check pass — remaining "
+                      "unclear items will be attempted on a future run.")
+                stopped_early = True
+                break
+
+            res_map = audit_group_web_crosscheck(make, model, gen, g_rows, crosscheck_targets)
+            for idx, row in g_rows:
+                v_id = str(row.get(ID_COL, idx))
+                res = res_map.get(v_id)
+                if res:
+                    apply_crosscheck_result(idx, row, res, crosscheck_targets.get(idx, set()))
+
+            crosscheck_group_count += 1
+            if crosscheck_group_count % SAVE_EVERY_N_GROUPS == 0:
+                df.to_csv(local(OUTPUT_CSV_NAME), index=False)
+                upload_outputs()
+                print(f"[cross-check {crosscheck_group_count}/{len(grouped_for_crosscheck)}] "
+                      f"vehicles done, checkpoint uploaded to Drive.")
 
     # --- No-brochure fallback: audit via web search instead of leaving these
     # rows permanently unaudited, as long as daily cap budget remains. ---
