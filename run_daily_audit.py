@@ -423,6 +423,15 @@ For every binary flag, reply with EXACTLY one of these three characters, nothing
         Use "U" whenever you are not certain — never guess "0" just because a feature
         isn't mentioned. Absence of mention is NOT the same as absence of the feature.
 
+Two specific traps to avoid, since they are the most common source of wrong "0" answers:
+  - A document that lists "Standard Equipment" once for the whole model/range (not repeated
+    per trim) means every trim covered by that document HAS those features — mark "1", not
+    "U" or "0", unless a separate trim-comparison table explicitly excludes that trim.
+  - In a trim-comparison table, a blank/empty cell does not automatically mean "not available".
+    Only mark "0" when the cell contains an explicit negative marker (a dash, an empty circle
+    next to a legend that defines it as "not available", "N/A", "-", etc.) as defined by that
+    specific table's own legend. If the table's convention for a blank cell is unclear, use "U".
+
 Only report a spec_discrepancy when the source clearly states a different value than the
 current one (ignore trivial rounding/unit-notation differences). Only report a missing trim
 when confident it's genuinely absent from the KNOWN TRIMS list given to you. Keep every text
@@ -676,6 +685,10 @@ For each trim below, confirm ONLY the specific listed features from an official 
 source (or a reputable dealer page if no official page exists). Do not report on any feature
 not listed for that trim.
 
+Some of these features may already be recorded as present in our data. Do not report a feature
+as absent/removed unless you find clear, current evidence for that specific trim and model
+year — a feature simply not being mentioned on a page is not evidence it was removed.
+
 {json.dumps(per_trim_targets, indent=None)}
 
 For each trim, state clearly which listed features it HAS and which it does NOT have. If you
@@ -850,14 +863,33 @@ def apply_audit_result(idx, row, res, source_vpath, source_label):
         if spec_col not in BINARY_SPECS or spec_col not in df.columns:
             continue
         val_str = str(val).strip().upper()
+        old_val = df.at[idx, spec_col]
+        try:
+            old_int = int(old_val) if pd.notna(old_val) else None
+        except (ValueError, TypeError):
+            old_int = None
+
         if val_str not in ("0", "1"):
-            if val_str == "U" and source_label == "Brochure":
+            if val_str == "U":
                 UNCLEAR_SPECS_BY_ROW.setdefault(idx, set()).add(spec_col)
             continue  # 'U' (or anything unexpected) -- source didn't clearly say either
                       # way for this trim; leave the existing value untouched rather
                       # than overwrite it with a guess.
+
         new_val = int(val_str)
-        old_val = df.at[idx, spec_col]
+
+        # SAFETY NET: never let a single pass (brochure OR web search) silently
+        # flip a feature the sheet already says the car HAS down to absent.
+        # This is exactly the failure mode that produced wrong
+        # power_windows/power_door_locks corrections before -- a feature not
+        # being mentioned FOR THIS TRIM in a multi-trim document got read as
+        # "confirmed absent" instead of "not addressed here". A 1->0 change
+        # now requires an independent, targeted second confirmation via the
+        # cross-check pass before it's trusted -- same queue as 'U'.
+        if old_int == 1 and new_val == 0:
+            UNCLEAR_SPECS_BY_ROW.setdefault(idx, set()).add(spec_col)
+            continue
+
         if values_differ(old_val, new_val):
             row_changes.append((spec_col, old_val, new_val, ''))
             CHANGED_CELLS[(idx, spec_col)] = True
@@ -953,47 +985,11 @@ def run_pipeline():
             upload_outputs()
             print(f"[{group_count}/{total_groups}] groups done, checkpoint uploaded to Drive.")
 
-    # --- Cross-check pass: for brochure-audited rows where specific features
-    # came back 'U' (not stated in the brochure), do one targeted web search
-    # per vehicle to try to confirm just those items -- keeps every row's
-    # data complete rather than permanently leaving gaps whenever a brochure
-    # is incomplete. ---
-    crosscheck_targets = {idx: fields for idx, fields in UNCLEAR_SPECS_BY_ROW.items() if fields}
-    if crosscheck_targets:
-        grouped_for_crosscheck = {}
-        for idx, fields in crosscheck_targets.items():
-            if idx not in df.index:
-                continue
-            row = df.loc[idx]
-            key = (row.get(MAKE_COL), row.get(MODEL_COL), row.get(GEN_COL))
-            grouped_for_crosscheck.setdefault(key, []).append((idx, row))
-
-        print(f"\n{len(crosscheck_targets)} row(s) had features the brochure didn't state — "
-              f"attempting a targeted web cross-check for as many as today's remaining cap allows.")
-        crosscheck_group_count = 0
-        for (make, model, gen), g_rows in grouped_for_crosscheck.items():
-            if daily_cap_exhausted():
-                print("\nDaily request cap reached during cross-check pass — remaining "
-                      "unclear items will be attempted on a future run.")
-                stopped_early = True
-                break
-
-            res_map = audit_group_web_crosscheck(make, model, gen, g_rows, crosscheck_targets)
-            for idx, row in g_rows:
-                v_id = str(row.get(ID_COL, idx))
-                res = res_map.get(v_id)
-                if res:
-                    apply_crosscheck_result(idx, row, res, crosscheck_targets.get(idx, set()))
-
-            crosscheck_group_count += 1
-            if crosscheck_group_count % SAVE_EVERY_N_GROUPS == 0:
-                df.to_csv(local(OUTPUT_CSV_NAME), index=False)
-                upload_outputs()
-                print(f"[cross-check {crosscheck_group_count}/{len(grouped_for_crosscheck)}] "
-                      f"vehicles done, checkpoint uploaded to Drive.")
-
     # --- No-brochure fallback: audit via web search instead of leaving these
-    # rows permanently unaudited, as long as daily cap budget remains. ---
+    # rows permanently unaudited, as long as daily cap budget remains. Runs
+    # BEFORE the cross-check pass below so any 1->0 downgrades or 'U' answers
+    # it produces get queued for the same second-confirmation pass, not just
+    # the ones from the brochure loop above. ---
     no_brochure_df = df[df['Accuracy_Status'] == "Flagged: Missing Brochure PDF"]
     grouped_by_vehicle = {}
     for idx, row in no_brochure_df.iterrows():
@@ -1026,6 +1022,47 @@ def run_pipeline():
             df.to_csv(local(OUTPUT_CSV_NAME), index=False)
             upload_outputs()
             print(f"[web search {web_group_count}/{total_web_groups}] vehicles done, checkpoint uploaded to Drive.")
+
+    # --- Cross-check pass: for ANY row where a feature came back 'U' (not
+    # clearly stated), OR where a pass tried to flip an existing 1 down to 0
+    # (the higher-risk case — see the safety net in apply_audit_result), do
+    # one targeted, independent web search per vehicle to confirm just those
+    # specific items before trusting them. Runs last so it covers gaps from
+    # BOTH the brochure pass and the no-brochure web-search pass above. ---
+    crosscheck_targets = {idx: fields for idx, fields in UNCLEAR_SPECS_BY_ROW.items() if fields}
+    if crosscheck_targets:
+        grouped_for_crosscheck = {}
+        for idx, fields in crosscheck_targets.items():
+            if idx not in df.index:
+                continue
+            row = df.loc[idx]
+            key = (row.get(MAKE_COL), row.get(MODEL_COL), row.get(GEN_COL))
+            grouped_for_crosscheck.setdefault(key, []).append((idx, row))
+
+        print(f"\n{len(crosscheck_targets)} row(s) have features that were either unclear or "
+              f"flagged for possible removal — attempting a targeted, independent web "
+              f"cross-check for as many as today's remaining cap allows before trusting them.")
+        crosscheck_group_count = 0
+        for (make, model, gen), g_rows in grouped_for_crosscheck.items():
+            if daily_cap_exhausted():
+                print("\nDaily request cap reached during cross-check pass — remaining "
+                      "unclear items will be attempted on a future run.")
+                stopped_early = True
+                break
+
+            res_map = audit_group_web_crosscheck(make, model, gen, g_rows, crosscheck_targets)
+            for idx, row in g_rows:
+                v_id = str(row.get(ID_COL, idx))
+                res = res_map.get(v_id)
+                if res:
+                    apply_crosscheck_result(idx, row, res, crosscheck_targets.get(idx, set()))
+
+            crosscheck_group_count += 1
+            if crosscheck_group_count % SAVE_EVERY_N_GROUPS == 0:
+                df.to_csv(local(OUTPUT_CSV_NAME), index=False)
+                upload_outputs()
+                print(f"[cross-check {crosscheck_group_count}/{len(grouped_for_crosscheck)}] "
+                      f"vehicles done, checkpoint uploaded to Drive.")
 
     df.to_csv(local(OUTPUT_CSV_NAME), index=False)
     refresh_audit_progress()
