@@ -25,6 +25,7 @@ jobs:
         run: echo '${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}' > service_account.json
 
       - name: Run today's audit batch
+        id: run_audit
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GDRIVE_SERVICE_ACCOUNT_FILE: service_account.json
@@ -45,3 +46,44 @@ jobs:
           name: audit-run-data
           path: run_data/
           retention-days: 14
+
+      # ---- Email report -----------------------------------------------------
+      # Runs regardless of whether the audit step succeeded, hit the daily
+      # cap, or crashed, so you always get a result in your inbox instead of
+      # having to check the Actions tab.
+      - name: Build email body
+        if: always()
+        run: |
+          if [ "${{ steps.run_audit.outcome }}" = "success" ]; then
+            echo "STATUS_LINE=MDM Audit run completed" >> "$GITHUB_ENV"
+          else
+            echo "STATUS_LINE=MDM Audit run FAILED (outcome: ${{ steps.run_audit.outcome }})" >> "$GITHUB_ENV"
+          fi
+          {
+            echo "EMAIL_BODY<<EOF"
+            if [ -f run_data/audit_summary.txt ]; then
+              cat run_data/audit_summary.txt
+            else
+              echo "No audit_summary.txt was produced — the run likely failed before reaching"
+              echo "the summary step. Check the workflow run log and the uploaded"
+              echo "'audit-run-data' artifact for details."
+            fi
+            echo ""
+            echo "----"
+            echo "Full log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Send email report
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ vars.MAIL_SERVER || 'smtp.gmail.com' }}
+          server_port: ${{ vars.MAIL_PORT || 465 }}
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: ${{ secrets.MAIL_USERNAME }}
+          to: ${{ secrets.MAIL_TO }}
+          subject: "${{ env.STATUS_LINE }} — ${{ github.repository }}"
+          body: ${{ env.EMAIL_BODY }}
