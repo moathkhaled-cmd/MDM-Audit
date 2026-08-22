@@ -18,26 +18,32 @@
 #      folder, overwriting the previous version of each — so tomorrow's run
 #      picks up exactly where today's left off, same as the Colab version.
 # ============================================================================
-
-# ============================================================================
 # ArabWheels AE — MDM Spec Audit (GitHub Actions daily runner — Gemini)
 # ============================================================================
-# Same audit logic as the Colab version, but every file read/write goes
-# through the Drive API (via drive_utils.py) instead of a local mounted
-# filesystem, since GitHub Actions runners don't have Drive mounted.
+# Every file read/write goes through the Drive API (via drive_utils.py)
+# instead of a local mounted filesystem, since GitHub Actions runners don't
+# have Drive mounted.
 #
 # Each run:
 #   1. Downloads the CSV from Drive (the audited one if it already exists
 #      there, otherwise the original).
 #   2. Lists every PDF under your brochures folder (metadata only — no PDF
 #      bytes downloaded yet) and re-runs matching fresh every time (cheap,
-#      local, and keeps things correct across the Colab -> Actions switch).
-#   3. Processes brochure groups until DAILY_REQUEST_CAP is hit or the queue
-#      is empty, downloading only the PDFs it actually needs to read today.
+#      local, and keeps things correct across environment switches).
+#   3. Processes brochure groups, then no-brochure vehicles via web search,
+#      then a cross-check pass — each stopping cleanly once DAILY_REQUEST_CAP
+#      or the relevant API key(s) are exhausted, resuming automatically on
+#      the next scheduled run.
 #   4. Uploads the updated CSV, highlighted .xlsx, discrepancy/new-trim
 #      reports, audit log, and progress snapshot back to the SAME Drive
-#      folder, overwriting the previous version of each — so tomorrow's run
-#      picks up exactly where today's left off, same as the Colab version.
+#      folder, overwriting the previous version of each.
+#
+# API KEYS (3 total, 2 roles):
+#   GEMINI_API_KEY   -> dedicated to web-search/grounded audits (no-brochure
+#                       fallback + the cross-check pass's search step)
+#   GEMINI_API_KEY_2 -> primary key for brochure audits (the "usual" path)
+#   GEMINI_API_KEY_3 -> optional automatic failover if key 2 hits its daily
+#                       quota mid-run; the script switches over and keeps going
 # ============================================================================
 
 import os
@@ -84,8 +90,28 @@ os.makedirs(LOCAL_DIR, exist_ok=True)
 def local(name):
     return os.path.join(LOCAL_DIR, name)
 
-GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
-client = genai.Client(api_key=GEMINI_API_KEY)
+def _read_key(name):
+    return os.environ.get(name, '').strip()
+
+# Three keys, two roles:
+#   - GEMINI_API_KEY  : dedicated to web-search/grounded calls (the no-brochure
+#     fallback audit + the cross-check pass's search step). Kept separate so
+#     that path's usage never eats into the brochure-audit keys' quota.
+#   - GEMINI_API_KEY_2, GEMINI_API_KEY_3 : the "usual" path -- every brochure
+#     audit call, plus the structured-JSON finalization step that follows a
+#     web search. Key 3 is an automatic failover: if key 2 hits ITS OWN daily
+#     quota, the script switches to key 3 for the rest of the run instead of
+#     stopping. GEMINI_API_KEY_3 is optional -- if unset, key 2 alone is used
+#     (no failover, same behavior as before this feature was added).
+WEB_SEARCH_API_KEY = _read_key('GEMINI_API_KEY')
+if not WEB_SEARCH_API_KEY:
+    raise RuntimeError("Set GEMINI_API_KEY (dedicated to web-search audits).")
+web_search_client = genai.Client(api_key=WEB_SEARCH_API_KEY)
+
+_brochure_keys = [k for k in [_read_key('GEMINI_API_KEY_2'), _read_key('GEMINI_API_KEY_3')] if k]
+if not _brochure_keys:
+    raise RuntimeError("Set at least GEMINI_API_KEY_2 (used for brochure audits).")
+brochure_clients = [genai.Client(api_key=k) for k in _brochure_keys]
 
 MODEL_NAME = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
 
@@ -204,6 +230,72 @@ def daily_cap_try_consume():
 def daily_cap_exhausted():
     with _daily_lock:
         return _daily_count >= DAILY_REQUEST_CAP
+
+# --- Per-key-pool quota tracking (separate from the DAILY_REQUEST_CAP budget
+# above, which is a simple request-count safety ceiling regardless of which
+# key served it). This tracks whether Google itself has actually rejected a
+# key for exceeding ITS real daily quota, and drives automatic failover. ---
+
+_active_brochure_key_lock = threading.Lock()
+_active_brochure_key_index = 0
+_brochure_keys_exhausted = False
+
+def get_active_brochure_client():
+    with _active_brochure_key_lock:
+        return brochure_clients[_active_brochure_key_index], _active_brochure_key_index
+
+def advance_brochure_key(failed_index):
+    """Called when the key at failed_index just hit its real daily quota.
+    Switches to the next configured key for all subsequent calls. Returns
+    False once every brochure-audit key has been exhausted."""
+    global _active_brochure_key_index, _brochure_keys_exhausted
+    with _active_brochure_key_lock:
+        if failed_index != _active_brochure_key_index:
+            return True  # another call already advanced past this key
+        if _active_brochure_key_index + 1 < len(brochure_clients):
+            _active_brochure_key_index += 1
+            print(f"[API key] Brochure-audit key {failed_index + 1} hit its daily quota — "
+                  f"switching to key {_active_brochure_key_index + 1}.")
+            return True
+        _brochure_keys_exhausted = True
+        print(f"[API key] All {len(brochure_clients)} brochure-audit key(s) have hit their daily quota.")
+        return False
+
+def brochure_keys_exhausted():
+    return _brochure_keys_exhausted
+
+_web_search_key_exhausted = False
+
+def mark_web_search_key_exhausted():
+    global _web_search_key_exhausted
+    _web_search_key_exhausted = True
+    print("[API key] The web-search key has hit its daily quota — web-search audits and the "
+          "cross-check pass will stop for the rest of this run (brochure audits continue normally).")
+
+def web_search_key_exhausted():
+    return _web_search_key_exhausted
+
+def should_stop_brochure_pass():
+    return daily_cap_exhausted() or brochure_keys_exhausted()
+
+def stop_reason_brochure():
+    if brochure_keys_exhausted():
+        return "All brochure-audit API keys have hit their daily quota"
+    return f"Daily request cap ({DAILY_REQUEST_CAP}) reached"
+
+def should_stop_web_search_pass():
+    # This path needs BOTH the web-search key (for grounding) and a working
+    # brochure-pool key (for the structured-extraction step that follows the
+    # search) -- if either is gone, further attempts here would just fail
+    # one at a time instead of stopping cleanly.
+    return daily_cap_exhausted() or web_search_key_exhausted() or brochure_keys_exhausted()
+
+def stop_reason_web_search():
+    if web_search_key_exhausted():
+        return "The web-search API key has hit its daily quota"
+    if brochure_keys_exhausted():
+        return "All brochure-audit API keys have hit their daily quota (needed to finalize web-search results)"
+    return f"Daily request cap ({DAILY_REQUEST_CAP}) reached"
 
 def values_differ(old_val, new_val):
     if pd.isna(old_val) and (new_val is None or str(new_val).strip() == ''):
@@ -517,14 +609,20 @@ WEB_SEARCH_CONFIG = types.GenerateContentConfig(
 
 def call_gemini_web_search_with_retry(user_prompt: str):
     for attempt in range(MAX_RETRIES):
+        if web_search_key_exhausted():
+            return None, "The web-search API key has hit its daily quota — stopping web-search audits for today."
         if not daily_cap_try_consume():
             return None, f"Daily request cap ({DAILY_REQUEST_CAP}) reached — stopping for today."
         try:
             time.sleep(SLEEP_BETWEEN_REQUESTS)
-            response = client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=WEB_SEARCH_CONFIG)
+            response = web_search_client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=WEB_SEARCH_CONFIG)
             return response.text, None
         except Exception as e:
             msg = str(e)
+            is_daily_quota = "PerDay" in msg or "daily" in msg.lower()
+            if is_daily_quota:
+                mark_web_search_key_exhausted()
+                return None, f"Gemini Web Search Daily Quota Error: {msg[:300]}"
             if any(code in msg for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
                 delay = parse_retry_delay_seconds(msg) or ((2 ** (attempt + 1)) + random.uniform(1, 2))
                 print(f"[Rate Limit - web search] attempt {attempt + 1}/{MAX_RETRIES}, waiting {delay:.1f}s...")
@@ -544,8 +642,11 @@ def parse_retry_delay_seconds(err_msg: str):
 
 def call_gemini_with_retry(user_prompt: str):
     for attempt in range(MAX_RETRIES):
+        if brochure_keys_exhausted():
+            return None, "All brochure-audit API keys have hit their daily quota — stopping for today."
         if not daily_cap_try_consume():
             return None, f"Daily request cap ({DAILY_REQUEST_CAP}) reached — stopping for today."
+        client, key_idx = get_active_brochure_client()
         try:
             time.sleep(SLEEP_BETWEEN_REQUESTS)
             response = client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=GEN_CONFIG)
@@ -554,7 +655,9 @@ def call_gemini_with_retry(user_prompt: str):
             msg = str(e)
             is_daily_quota = "PerDay" in msg or "daily" in msg.lower()
             if is_daily_quota:
-                return None, f"Gemini Daily Quota Error: {msg[:300]}"
+                if advance_brochure_key(key_idx):
+                    continue  # retry immediately on the new key, same attempt budget
+                return None, f"Gemini Daily Quota Error (all brochure keys exhausted): {msg[:300]}"
             if any(code in msg for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
                 delay = parse_retry_delay_seconds(msg)
                 if delay is None:
@@ -809,19 +912,36 @@ def report_unaudited_rows():
         pending[cols].to_csv(local(NOT_YET_AUDITED_NAME), index=False)
     return len(pending)
 
-# Statuses that mean "hasn't actually been looked at by the AI yet" -- either
-# still queued, or blocked on a data problem (bad make/model, ambiguous
-# match) that no amount of auditing can resolve until the sheet itself is
-# fixed. Everything else means some audit path (brochure or web search)
-# actually ran and produced a real outcome.
-NOT_YET_AUDITED_STATUSES = {
+# Statuses that mean "hasn't actually been looked at by the AI yet, or the
+# attempt failed" -- covers rows still queued, blocked on a data problem
+# (bad make/model, ambiguous match) that only a sheet fix can resolve, AND
+# any dynamic error message (quota, parse failure, exceeded retries) from a
+# failed attempt. That last part matters: error messages include live
+# details (the raw API error text) so they can never match a fixed set of
+# literal strings -- checking by PREFIX is what makes a row that failed with
+# "Gemini Daily Quota Error: 429 RESOURCE_EXHAUSTED..." correctly count as
+# Pending (and get retried next run) instead of being miscounted as Audited
+# just because its exact text isn't in a hardcoded list.
+NOT_YET_AUDITED_EXACT = {
     "", "Flagged: Missing Brochure PDF", "Flagged: Missing Make/Model in Sheet",
     "Flagged: Ambiguous Brochure Match",
 }
+NOT_YET_AUDITED_PREFIXES = (
+    "Gemini API Error", "Gemini Daily Quota Error", "Gemini Web Search Error",
+    "Daily request cap", "Parse Failure",
+)
+
+def is_retryable_status(status) -> bool:
+    if pd.isna(status) or status == "":
+        return True
+    s = str(status)
+    if s in NOT_YET_AUDITED_EXACT:
+        return True
+    return any(s.startswith(p) for p in NOT_YET_AUDITED_PREFIXES)
 
 def refresh_audit_progress():
     df['Audit_Progress'] = df['Accuracy_Status'].apply(
-        lambda s: "Pending" if (pd.isna(s) or s in NOT_YET_AUDITED_STATUSES) else "Audited"
+        lambda s: "Pending" if is_retryable_status(s) else "Audited"
     )
 
 def upload_outputs():
@@ -831,6 +951,23 @@ def upload_outputs():
         if os.path.exists(path):
             drive_utils.upload_or_update(drive, GDRIVE_ROOT_FOLDER_ID, path, remote_name=fname)
             print(f"  Uploaded {fname} to Drive.")
+
+def save_checkpoint(status_note=""):
+    """Every checkpoint save goes through here so Audit_Progress is always
+    recomputed right before the CSV is written and uploaded -- otherwise a
+    run that gets interrupted (timeout, crash, or a clean early stop) can
+    leave Drive holding a CSV where Accuracy_Status was just updated but
+    Audit_Progress still reflects an earlier state (blank/stale for those
+    rows) until a run reaches the very end. This was the root cause of the
+    blank Audit_Progress cells seen after a run that hit its quota mid-way.
+    report_unaudited_rows() is also refreshed here so Not_Yet_Audited.csv
+    stays accurate at every checkpoint, not just at the end."""
+    refresh_audit_progress()
+    report_unaudited_rows()
+    df.to_csv(local(OUTPUT_CSV_NAME), index=False)
+    upload_outputs()
+    if status_note:
+        print(status_note)
 
 UNCLEAR_SPECS_BY_ROW = {}  # idx -> set of BINARY_SPECS column names that came back 'U' from the brochure
 
@@ -945,8 +1082,8 @@ def run_pipeline():
     group_count = 0
     stopped_early = False
     for vpath, g_rows in grouped_by_pdf.items():
-        if daily_cap_exhausted():
-            print(f"\nDaily request cap ({DAILY_REQUEST_CAP}) reached — stopping cleanly here. "
+        if should_stop_brochure_pass():
+            print(f"\n{stop_reason_brochure()} — stopping cleanly here. "
                   f"Tomorrow's scheduled run will continue automatically.")
             stopped_early = True
             break
@@ -980,17 +1117,15 @@ def run_pipeline():
 
         group_count += 1
         if group_count % SAVE_EVERY_N_GROUPS == 0:
-            df.to_csv(local(OUTPUT_CSV_NAME), index=False)
             write_progress_snapshot("in_progress", group_count, total_groups, {"last_brochure": vpath})
-            upload_outputs()
-            print(f"[{group_count}/{total_groups}] groups done, checkpoint uploaded to Drive.")
+            save_checkpoint(f"[{group_count}/{total_groups}] groups done, checkpoint uploaded to Drive.")
 
     # --- No-brochure fallback: audit via web search instead of leaving these
     # rows permanently unaudited, as long as daily cap budget remains. Runs
     # BEFORE the cross-check pass below so any 1->0 downgrades or 'U' answers
     # it produces get queued for the same second-confirmation pass, not just
     # the ones from the brochure loop above. ---
-    no_brochure_df = df[df['Accuracy_Status'] == "Flagged: Missing Brochure PDF"]
+    no_brochure_df = df[(df['Brochure_File_Found'] != True) & (df['Accuracy_Status'].apply(is_retryable_status))]
     grouped_by_vehicle = {}
     for idx, row in no_brochure_df.iterrows():
         key = (row.get(MAKE_COL), row.get(MODEL_COL), row.get(GEN_COL))
@@ -1003,9 +1138,9 @@ def run_pipeline():
 
     web_group_count = 0
     for (make, model, gen), g_rows in grouped_by_vehicle.items():
-        if daily_cap_exhausted():
-            print(f"\nDaily request cap reached during web-search fallback — remaining "
-                  f"no-brochure vehicles will be attempted on a future run.")
+        if should_stop_web_search_pass():
+            print(f"\n{stop_reason_web_search()} — remaining no-brochure vehicles will be "
+                  f"attempted on a future run.")
             stopped_early = True
             break
 
@@ -1019,9 +1154,7 @@ def run_pipeline():
 
         web_group_count += 1
         if web_group_count % SAVE_EVERY_N_GROUPS == 0:
-            df.to_csv(local(OUTPUT_CSV_NAME), index=False)
-            upload_outputs()
-            print(f"[web search {web_group_count}/{total_web_groups}] vehicles done, checkpoint uploaded to Drive.")
+            save_checkpoint(f"[web search {web_group_count}/{total_web_groups}] vehicles done, checkpoint uploaded to Drive.")
 
     # --- Cross-check pass: for ANY row where a feature came back 'U' (not
     # clearly stated), OR where a pass tried to flip an existing 1 down to 0
@@ -1044,9 +1177,9 @@ def run_pipeline():
               f"cross-check for as many as today's remaining cap allows before trusting them.")
         crosscheck_group_count = 0
         for (make, model, gen), g_rows in grouped_for_crosscheck.items():
-            if daily_cap_exhausted():
-                print("\nDaily request cap reached during cross-check pass — remaining "
-                      "unclear items will be attempted on a future run.")
+            if should_stop_web_search_pass():
+                print(f"\n{stop_reason_web_search()} during cross-check pass — remaining "
+                      f"unclear items will be attempted on a future run.")
                 stopped_early = True
                 break
 
@@ -1059,15 +1192,13 @@ def run_pipeline():
 
             crosscheck_group_count += 1
             if crosscheck_group_count % SAVE_EVERY_N_GROUPS == 0:
-                df.to_csv(local(OUTPUT_CSV_NAME), index=False)
-                upload_outputs()
-                print(f"[cross-check {crosscheck_group_count}/{len(grouped_for_crosscheck)}] "
-                      f"vehicles done, checkpoint uploaded to Drive.")
+                save_checkpoint(f"[cross-check {crosscheck_group_count}/{len(grouped_for_crosscheck)}] "
+                                 f"vehicles done, checkpoint uploaded to Drive.")
 
-    df.to_csv(local(OUTPUT_CSV_NAME), index=False)
     refresh_audit_progress()
-
     unaudited_count = report_unaudited_rows()
+    df.to_csv(local(OUTPUT_CSV_NAME), index=False)
+
     write_progress_snapshot(
         "stopped_daily_cap" if stopped_early else "complete",
         group_count, total_groups, {"rows_still_unaudited": int(unaudited_count)},
