@@ -9,10 +9,13 @@
 
 import io
 import os
+import random
+import time
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.errors import HttpError
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
@@ -59,14 +62,14 @@ def list_children(service, folder_id):
     """Yields (file_id, name, mime_type) for the direct children of folder_id."""
     page_token = None
     while True:
-        resp = service.files().list(
+        resp = _with_retry(lambda: service.files().list(
             q=f"'{folder_id}' in parents and trashed = false",
             fields="nextPageToken, files(id, name, mimeType)",
             pageToken=page_token,
             pageSize=1000,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-        ).execute()
+        ).execute())
         for f in resp.get('files', []):
             yield f['id'], f['name'], f['mimeType']
         page_token = resp.get('nextPageToken')
@@ -94,14 +97,42 @@ def find_file_id_by_name(service, folder_id, name):
     return None
 
 
+def _is_retryable_drive_error(e: HttpError) -> bool:
+    status = getattr(e.resp, 'status', None)
+    if status in (403, 429, 500, 502, 503, 504):
+        # 403 covers Drive's userRateLimitExceeded/rateLimitExceeded — these
+        # are throttling, not a permissions problem, and Google's own
+        # guidance is to retry with backoff rather than treat them as fatal.
+        return True
+    return False
+
+def _with_retry(fn, max_retries=6, base_delay=2.0):
+    """Runs fn() with exponential backoff + jitter on Drive throttling
+    errors. Without this, a single 'User rate limit exceeded' response
+    (which happens routinely under normal use, not just abuse) crashes the
+    entire script instead of just costing a few seconds."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except HttpError as e:
+            if not _is_retryable_drive_error(e) or attempt == max_retries - 1:
+                raise
+            delay = (base_delay * (2 ** attempt)) + random.uniform(0, 1.5)
+            print(f"  [Drive] {e.resp.status} on attempt {attempt + 1}/{max_retries} "
+                  f"— retrying in {delay:.1f}s...")
+            time.sleep(delay)
+
+
 def download_bytes(service, file_id) -> bytes:
-    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _status, done = downloader.next_chunk()
-    return buf.getvalue()
+    def _do():
+        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _status, done = downloader.next_chunk()
+        return buf.getvalue()
+    return _with_retry(_do)
 
 
 def download_to_path(service, file_id, local_path):
@@ -117,11 +148,13 @@ def upload_or_update(service, folder_id, local_path, remote_name=None, mime_type
     overwrites the existing one in place — so daily re-runs replace the same
     file on Drive instead of piling up dated duplicates."""
     remote_name = remote_name or os.path.basename(local_path)
-    existing_id = find_file_id_by_name(service, folder_id, remote_name)
+    existing_id = _with_retry(lambda: find_file_id_by_name(service, folder_id, remote_name))
     media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
     if existing_id:
-        service.files().update(fileId=existing_id, media_body=media, supportsAllDrives=True).execute()
+        _with_retry(lambda: service.files().update(
+            fileId=existing_id, media_body=media, supportsAllDrives=True).execute())
         return existing_id
     file_metadata = {'name': remote_name, 'parents': [folder_id]}
-    created = service.files().create(body=file_metadata, media_body=media, fields='id', supportsAllDrives=True).execute()
+    created = _with_retry(lambda: service.files().create(
+        body=file_metadata, media_body=media, fields='id', supportsAllDrives=True).execute())
     return created['id']
