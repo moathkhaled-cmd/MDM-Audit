@@ -84,6 +84,15 @@ AUDIT_LOG_NAME = 'audit_log.jsonl'
 SUMMARY_NAME = 'audit_summary.txt'
 PROGRESS_NAME = 'audit_progress.json'
 NOT_YET_AUDITED_NAME = 'Not_Yet_Audited.csv'
+# Cumulative record of every (version_spec_id, column) that has EVER been
+# corrected, across all runs -- not just the current one. Without this, the
+# highlighted .xlsx is rebuilt from scratch every run and only shows THAT
+# run's corrections in red, since the in-memory CHANGED_CELLS dict starts
+# empty every time the script starts fresh (GitHub Actions runners are
+# ephemeral). This file is downloaded at the start of every run and re-
+# uploaded at every checkpoint, so today's highlights stack on top of every
+# previous run's instead of replacing them.
+CHANGED_CELLS_REGISTRY_NAME = 'Changed_Cells_Registry.json'
 
 LOCAL_DIR = './run_data'
 os.makedirs(LOCAL_DIR, exist_ok=True)
@@ -108,7 +117,10 @@ if not WEB_SEARCH_API_KEY:
     raise RuntimeError("Set GEMINI_API_KEY (dedicated to web-search audits).")
 web_search_client = genai.Client(api_key=WEB_SEARCH_API_KEY)
 
-_brochure_keys = [k for k in [_read_key('GEMINI_API_KEY_2'), _read_key('GEMINI_API_KEY_3')] if k]
+_brochure_keys = [k for k in [
+    _read_key('GEMINI_API_KEY_2'), _read_key('GEMINI_API_KEY_3'),
+    _read_key('GEMINI_API_KEY_4'), _read_key('GEMINI_API_KEY_5'), _read_key('GEMINI_API_KEY_6'),
+] if k]
 if not _brochure_keys:
     raise RuntimeError("Set at least GEMINI_API_KEY_2 (used for brochure audits).")
 brochure_clients = [genai.Client(api_key=k) for k in _brochure_keys]
@@ -117,7 +129,6 @@ MODEL_NAME = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
 
 MAX_TEXT_CHARS = 40_000
 GROUP_BATCH_SIZE = 10
-SAVE_EVERY_N_GROUPS = 5
 MAX_RETRIES = 5
 
 def get_int_env(name, default):
@@ -134,17 +145,30 @@ def get_int_env(name, default):
     return int(val) if val else default
 
 
+# How many groups between each Drive upload. Lower = safer progress (less
+# lost if the run crashes) but more Drive API calls. This was raised from 5
+# to 20 by default: the CSV is large (tens of MB), and re-uploading it every
+# 5 groups was hammering the Drive API frequently enough to trigger Google's
+# "User rate limit exceeded" throttling and crash the run entirely. Combined
+# with drive_utils.py now retrying throttled uploads with backoff instead of
+# crashing, this should be far more stable.
+SAVE_EVERY_N_GROUPS = get_int_env('SAVE_EVERY_N_GROUPS', 20)
+
 # Free-tier Gemini Flash is typically ~10-15 RPM depending on your account —
 # check https://ai.google.dev/gemini-api/docs/rate-limits and set this to
 # roughly 80% of your actual limit.
 RATE_LIMIT_RPM = get_int_env('RATE_LIMIT_RPM', 10)
 SLEEP_BETWEEN_REQUESTS = 60.0 / RATE_LIMIT_RPM
 
-# This is what makes it a genuine daily partition: each GitHub Actions run
-# does at most this many requests, then stops cleanly and picks back up on
-# tomorrow's scheduled run. Gemini free tier is also capped per-day (varies
-# by model/account) — set this to comfortably under your actual daily quota.
-DAILY_REQUEST_CAP = get_int_env('DAILY_REQUEST_CAP', 100)
+# This used to be the main thing that stopped a run (default 100, well under
+# any real Gemini quota) -- now that daily-quota rejections are detected
+# properly and failed over between keys (or stopped cleanly once ALL
+# relevant keys are truly exhausted), this cap matters much less: it's just
+# a sanity/cost ceiling, not the real limiter. Raised to 2000 so it doesn't
+# artificially cut a run short before the actual free-tier quota does. Set
+# lower yourself only if you want a hard ceiling for some other reason (e.g.
+# controlling run duration).
+DAILY_REQUEST_CAP = get_int_env('DAILY_REQUEST_CAP', 2000)
 
 MAKE_COL, MODEL_COL, GEN_COL, VERSION_COL = (
     'manufacturer_name', 'model_name', 'generation_name', 'version_name'
@@ -215,6 +239,19 @@ spec_discrepancy_details = []
 new_rows_from_brochures = []
 _missing_trim_seen = set()
 CHANGED_CELLS = {}
+
+def mark_changed(idx, col_name):
+    """Records a corrected cell both for THIS run's xlsx highlighting and in
+    the cross-run persistent registry (CHANGED_CELLS_REGISTRY, loaded from
+    Drive at startup), keyed by the row's stable version_spec_id rather than
+    the DataFrame's positional index, which isn't guaranteed to mean the
+    same row across separate runs."""
+    CHANGED_CELLS[(idx, col_name)] = True
+    try:
+        vid = str(df.at[idx, ID_COL])
+    except Exception:
+        return
+    CHANGED_CELLS_REGISTRY.setdefault(vid, set()).add(col_name)
 
 _daily_lock = threading.Lock()
 _daily_count = 0
@@ -332,6 +369,26 @@ else:
         raise FileNotFoundError(f"Couldn't find '{SOURCE_CSV_NAME}' in the Drive root folder.")
     drive_utils.download_to_path(drive, source_id, local(SOURCE_CSV_NAME))
     df = pd.read_csv(local(SOURCE_CSV_NAME), low_memory=False)
+
+# --- Pull down cumulative state that must survive across runs (the CSV
+# above is the main one, but these two are equally "state", not disposable
+# per-run output) ---
+_registry_id = drive_utils.find_file_id_by_name(drive, GDRIVE_ROOT_FOLDER_ID, CHANGED_CELLS_REGISTRY_NAME)
+if _registry_id:
+    drive_utils.download_to_path(drive, _registry_id, local(CHANGED_CELLS_REGISTRY_NAME))
+    with open(local(CHANGED_CELLS_REGISTRY_NAME), encoding='utf-8') as f:
+        _raw_registry = json.load(f)
+    CHANGED_CELLS_REGISTRY = {k: set(v) for k, v in _raw_registry.items()}
+    print(f"Loaded changed-cells history for {len(CHANGED_CELLS_REGISTRY)} row(s) from previous runs.")
+else:
+    CHANGED_CELLS_REGISTRY = {}
+
+# audit_log.jsonl is meant to accumulate forever, not restart every run --
+# download the existing one (if any) so this run's log_event() calls APPEND
+# to real history instead of silently replacing it when uploaded.
+_log_id = drive_utils.find_file_id_by_name(drive, GDRIVE_ROOT_FOLDER_ID, AUDIT_LOG_NAME)
+if _log_id:
+    drive_utils.download_to_path(drive, _log_id, local(AUDIT_LOG_NAME))
 
 for col in ['Brochure_File_Found', 'Matched_Brochure_Path', 'Accuracy_Status', 'Discrepancies_Flagged',
             'Match_Confidence', 'Audit_Source', 'Audit_Progress']:
@@ -838,7 +895,7 @@ def apply_crosscheck_result(idx, row, res, target_fields):
         old_val = df.at[idx, spec_col]
         if values_differ(old_val, new_val):
             row_changes.append((spec_col, old_val, new_val))
-            CHANGED_CELLS[(idx, spec_col)] = True
+            mark_changed(idx, spec_col)
         df.at[idx, spec_col] = new_val
         filled.append(spec_col)
 
@@ -944,13 +1001,36 @@ def refresh_audit_progress():
         lambda s: "Pending" if is_retryable_status(s) else "Audited"
     )
 
+def save_changed_cells_registry():
+    with open(local(CHANGED_CELLS_REGISTRY_NAME), 'w', encoding='utf-8') as f:
+        json.dump({vid: sorted(cols) for vid, cols in CHANGED_CELLS_REGISTRY.items()}, f, ensure_ascii=False)
+
 def upload_outputs():
+    """Uploads every output file, but a persistent Drive-side failure on one
+    file (even after drive_utils' own retry/backoff is exhausted) no longer
+    kills the whole run -- that would waste the remaining Gemini quota for
+    the day on nothing. The CSV is retried a second time on its own since
+    it's the one file that actually matters for resuming; the rest are
+    best-effort and just get picked up again at the next checkpoint."""
     for fname in [OUTPUT_CSV_NAME, OUTPUT_XLSX_HIGHLIGHTED_NAME, DISCREPANCY_DETAIL_NAME,
-                  NEW_TRIMS_NAME, AUDIT_LOG_NAME, SUMMARY_NAME, PROGRESS_NAME, NOT_YET_AUDITED_NAME]:
+                  NEW_TRIMS_NAME, AUDIT_LOG_NAME, SUMMARY_NAME, PROGRESS_NAME, NOT_YET_AUDITED_NAME,
+                  CHANGED_CELLS_REGISTRY_NAME]:
         path = local(fname)
-        if os.path.exists(path):
+        if not os.path.exists(path):
+            continue
+        try:
             drive_utils.upload_or_update(drive, GDRIVE_ROOT_FOLDER_ID, path, remote_name=fname)
             print(f"  Uploaded {fname} to Drive.")
+        except Exception as e:
+            print(f"  ! Upload failed for {fname} after retries ({e}) — will retry at the next checkpoint.")
+            if fname == OUTPUT_CSV_NAME:
+                try:
+                    time.sleep(10)
+                    drive_utils.upload_or_update(drive, GDRIVE_ROOT_FOLDER_ID, path, remote_name=fname)
+                    print(f"  Uploaded {fname} to Drive (second attempt succeeded).")
+                except Exception as e2:
+                    print(f"  ! {fname} still failed ({e2}) — this checkpoint's progress stays local "
+                          f"only; the next successful checkpoint will include it too.")
 
 def save_checkpoint(status_note=""):
     """Every checkpoint save goes through here so Audit_Progress is always
@@ -961,9 +1041,12 @@ def save_checkpoint(status_note=""):
     rows) until a run reaches the very end. This was the root cause of the
     blank Audit_Progress cells seen after a run that hit its quota mid-way.
     report_unaudited_rows() is also refreshed here so Not_Yet_Audited.csv
-    stays accurate at every checkpoint, not just at the end."""
+    stays accurate at every checkpoint, not just at the end. The changed-
+    cells registry is saved here too, so a mid-run crash doesn't lose
+    today's newly-tracked corrections from the cross-run highlight history."""
     refresh_audit_progress()
     report_unaudited_rows()
+    save_changed_cells_registry()
     df.to_csv(local(OUTPUT_CSV_NAME), index=False)
     upload_outputs()
     if status_note:
@@ -1029,7 +1112,7 @@ def apply_audit_result(idx, row, res, source_vpath, source_label):
 
         if values_differ(old_val, new_val):
             row_changes.append((spec_col, old_val, new_val, ''))
-            CHANGED_CELLS[(idx, spec_col)] = True
+            mark_changed(idx, spec_col)
         df.at[idx, spec_col] = new_val
 
     for sd in spec_discrepancies:
@@ -1041,7 +1124,7 @@ def apply_audit_result(idx, row, res, source_vpath, source_label):
         old_val = df.at[idx, field]
         if values_differ(old_val, brochure_val):
             row_changes.append((field, old_val, brochure_val, page_ref))
-            CHANGED_CELLS[(idx, field)] = True
+            mark_changed(idx, field)
             df.at[idx, field] = brochure_val
         with _detail_lock:
             spec_discrepancy_details.append({
@@ -1197,6 +1280,7 @@ def run_pipeline():
 
     refresh_audit_progress()
     unaudited_count = report_unaudited_rows()
+    save_changed_cells_registry()
     df.to_csv(local(OUTPUT_CSV_NAME), index=False)
 
     write_progress_snapshot(
@@ -1204,7 +1288,7 @@ def run_pipeline():
         group_count, total_groups, {"rows_still_unaudited": int(unaudited_count)},
     )
 
-    if CHANGED_CELLS or (df['Audit_Source'] == "Web Search (No Brochure)").any():
+    if CHANGED_CELLS_REGISTRY or (df['Audit_Source'] == "Web Search (No Brochure)").any():
         df.to_excel(local(OUTPUT_XLSX_HIGHLIGHTED_NAME), index=False, sheet_name='Audited', engine='openpyxl')
         import openpyxl
         wb = openpyxl.load_workbook(local(OUTPUT_XLSX_HIGHLIGHTED_NAME))
@@ -1223,18 +1307,29 @@ def run_pipeline():
             for col_pos in range(1, len(df.columns) + 1):
                 ws[f'{get_column_letter(col_pos)}{excel_row}'].fill = yellow_fill
 
-        # Red second, on top: individually corrected cells take priority over
-        # the row-level yellow so a changed value is never mistaken for an
-        # unchanged-but-web-sourced one.
-        for (row_idx, col_name), _ in CHANGED_CELLS.items():
-            if col_name not in col_positions or row_idx not in row_positions:
-                continue
+        # Red second, on top: EVERY cell ever corrected, in ANY run, not just
+        # this one -- CHANGED_CELLS_REGISTRY is the cross-run cumulative
+        # record (loaded from Drive at startup, updated via mark_changed()
+        # throughout this run). This is what makes highlights persist
+        # instead of the .xlsx only ever showing today's changes.
+        id_to_idx = {str(df.at[idx, ID_COL]): idx for idx in df.index}
+        registry_cells_applied = 0
+        for vid, cols in CHANGED_CELLS_REGISTRY.items():
+            row_idx = id_to_idx.get(vid)
+            if row_idx is None or row_idx not in row_positions:
+                continue  # row no longer present in the sheet
             excel_row = row_positions[row_idx] + 2
-            excel_col_letter = get_column_letter(col_positions[col_name])
-            ws[f'{excel_col_letter}{excel_row}'].fill = red_fill
+            for col_name in cols:
+                if col_name not in col_positions:
+                    continue
+                excel_col_letter = get_column_letter(col_positions[col_name])
+                ws[f'{excel_col_letter}{excel_row}'].fill = red_fill
+                registry_cells_applied += 1
+
         wb.save(local(OUTPUT_XLSX_HIGHLIGHTED_NAME))
-        print(f"Highlighted {len(CHANGED_CELLS)} corrected cell(s) red, "
-              f"{len(web_search_rows)} no-brochure row(s) yellow in {OUTPUT_XLSX_HIGHLIGHTED_NAME}")
+        print(f"Highlighted {registry_cells_applied} corrected cell(s) red (cumulative across all "
+              f"runs, {len(CHANGED_CELLS)} new this run), {len(web_search_rows)} no-brochure "
+              f"row(s) yellow in {OUTPUT_XLSX_HIGHLIGHTED_NAME}")
 
     if spec_discrepancy_details:
         pd.DataFrame(spec_discrepancy_details).to_csv(local(DISCREPANCY_DETAIL_NAME), index=False)
@@ -1267,4 +1362,22 @@ def run_pipeline():
         print("\nAll pending groups processed — nothing left in the queue.")
 
 if __name__ == "__main__":
-    run_pipeline()
+    try:
+        run_pipeline()
+    except Exception:
+        # Last-resort safety net: whatever got audited before an unexpected
+        # crash should still make it to Drive rather than being lost, so
+        # tomorrow's run has real progress to resume from instead of
+        # repeating today's work. The exception is re-raised afterward so
+        # the GitHub Actions run still shows as failed (you want to know).
+        print("\n[FATAL] Unexpected error — attempting one last save before exiting...")
+        try:
+            refresh_audit_progress()
+            report_unaudited_rows()
+            save_changed_cells_registry()
+            df.to_csv(local(OUTPUT_CSV_NAME), index=False)
+            upload_outputs()
+            print("Emergency save succeeded.")
+        except Exception as save_err:
+            print(f"Emergency save also failed: {save_err}")
+        raise
