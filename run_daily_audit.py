@@ -240,6 +240,22 @@ new_rows_from_brochures = []
 _missing_trim_seen = set()
 CHANGED_CELLS = {}
 
+def normalize_id(value) -> str:
+    """Stable string key for version_spec_id across runs. pandas reads a
+    numeric ID column as int64 normally, but as float64 the moment ANY row
+    in that column has a missing value that run -- so the same real ID can
+    stringify as '7461' one run and '7461.0' the next, purely depending on
+    unrelated data elsewhere in the sheet. Without normalizing, the
+    cross-run changed-cells registry silently stops matching rows the
+    moment that dtype flips, which looks exactly like 'only this run's
+    highlights show up' even though the registry itself is fine."""
+    s = str(value).strip()
+    if s.endswith('.0'):
+        head = s[:-2]
+        if head.lstrip('-').isdigit():
+            return head
+    return s
+
 def mark_changed(idx, col_name):
     """Records a corrected cell both for THIS run's xlsx highlighting and in
     the cross-run persistent registry (CHANGED_CELLS_REGISTRY, loaded from
@@ -248,7 +264,7 @@ def mark_changed(idx, col_name):
     same row across separate runs."""
     CHANGED_CELLS[(idx, col_name)] = True
     try:
-        vid = str(df.at[idx, ID_COL])
+        vid = normalize_id(df.at[idx, ID_COL])
     except Exception:
         return
     CHANGED_CELLS_REGISTRY.setdefault(vid, set()).add(col_name)
@@ -378,10 +394,14 @@ if _registry_id:
     drive_utils.download_to_path(drive, _registry_id, local(CHANGED_CELLS_REGISTRY_NAME))
     with open(local(CHANGED_CELLS_REGISTRY_NAME), encoding='utf-8') as f:
         _raw_registry = json.load(f)
-    CHANGED_CELLS_REGISTRY = {k: set(v) for k, v in _raw_registry.items()}
+    CHANGED_CELLS_REGISTRY = {}
+    for _k, _v in _raw_registry.items():
+        CHANGED_CELLS_REGISTRY.setdefault(normalize_id(_k), set()).update(_v)
     print(f"Loaded changed-cells history for {len(CHANGED_CELLS_REGISTRY)} row(s) from previous runs.")
 else:
     CHANGED_CELLS_REGISTRY = {}
+    print(f"No {CHANGED_CELLS_REGISTRY_NAME} found on Drive yet — this run's corrections will be "
+          f"the first entries in it (expected on the very first run after this fix).")
 
 # audit_log.jsonl is meant to accumulate forever, not restart every run --
 # download the existing one (if any) so this run's log_event() calls APPEND
@@ -1312,7 +1332,7 @@ def run_pipeline():
         # record (loaded from Drive at startup, updated via mark_changed()
         # throughout this run). This is what makes highlights persist
         # instead of the .xlsx only ever showing today's changes.
-        id_to_idx = {str(df.at[idx, ID_COL]): idx for idx in df.index}
+        id_to_idx = {normalize_id(df.at[idx, ID_COL]): idx for idx in df.index}
         registry_cells_applied = 0
         for vid, cols in CHANGED_CELLS_REGISTRY.items():
             row_idx = id_to_idx.get(vid)
