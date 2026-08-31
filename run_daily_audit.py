@@ -170,6 +170,35 @@ SLEEP_BETWEEN_REQUESTS = 60.0 / RATE_LIMIT_RPM
 # controlling run duration).
 DAILY_REQUEST_CAP = get_int_env('DAILY_REQUEST_CAP', 2000)
 
+# The ultimate safety net, independent of correctly diagnosing every
+# possible error shape from the API: no matter WHY things are going wrong
+# (a real daily quota, a much stricter RPM limit specifically on the
+# grounded-search tool that "PerDay"/"daily" text detection can't catch,
+# anything), the run must never just keep going until GitHub kills it after
+# its own job timeout. This is what actually caused the 4-hour runaway --
+# every single web-search call was hitting a persistent rate limit that
+# never said "daily", so the code kept retrying it as if each failure were
+# a fresh, unrelated, transient problem. Checked in every pass's stop
+# condition below.
+RUN_START_TIME = time.monotonic()
+MAX_RUNTIME_MINUTES = get_int_env('MAX_RUNTIME_MINUTES', 200)  # keep comfortably under the
+                                                                 # workflow's timeout-minutes (240)
+
+def time_budget_exceeded():
+    return (time.monotonic() - RUN_START_TIME) > (MAX_RUNTIME_MINUTES * 60)
+
+# Second safety net, specific to the failure actually seen: if a key keeps
+# failing its FULL retry ladder over and over with no successes in between,
+# something is persistently wrong with it right now (a strict RPM limit on
+# that specific endpoint, an outage, etc.) even if no individual error ever
+# says "daily quota". After this many consecutive full-retry failures, treat
+# the key as unusable for the rest of THIS run rather than hammering it
+# forever -- exactly like real daily-quota exhaustion, just detected by
+# behavior instead of by parsing error text.
+CONSECUTIVE_FAILURE_LIMIT = get_int_env('CONSECUTIVE_FAILURE_LIMIT', 5)
+_web_search_consecutive_failures = 0
+_brochure_consecutive_failures = 0
+
 MAKE_COL, MODEL_COL, GEN_COL, VERSION_COL = (
     'manufacturer_name', 'model_name', 'generation_name', 'version_name'
 )
@@ -319,19 +348,21 @@ def brochure_keys_exhausted():
 
 _web_search_key_exhausted = False
 
-def mark_web_search_key_exhausted():
+def mark_web_search_key_exhausted(reason="hit its daily quota"):
     global _web_search_key_exhausted
     _web_search_key_exhausted = True
-    print("[API key] The web-search key has hit its daily quota — web-search audits and the "
+    print(f"[API key] The web-search key {reason} — web-search audits and the "
           "cross-check pass will stop for the rest of this run (brochure audits continue normally).")
 
 def web_search_key_exhausted():
     return _web_search_key_exhausted
 
 def should_stop_brochure_pass():
-    return daily_cap_exhausted() or brochure_keys_exhausted()
+    return daily_cap_exhausted() or brochure_keys_exhausted() or time_budget_exceeded()
 
 def stop_reason_brochure():
+    if time_budget_exceeded():
+        return f"Run time budget ({MAX_RUNTIME_MINUTES} min) reached"
     if brochure_keys_exhausted():
         return "All brochure-audit API keys have hit their daily quota"
     return f"Daily request cap ({DAILY_REQUEST_CAP}) reached"
@@ -341,9 +372,11 @@ def should_stop_web_search_pass():
     # brochure-pool key (for the structured-extraction step that follows the
     # search) -- if either is gone, further attempts here would just fail
     # one at a time instead of stopping cleanly.
-    return daily_cap_exhausted() or web_search_key_exhausted() or brochure_keys_exhausted()
+    return daily_cap_exhausted() or web_search_key_exhausted() or brochure_keys_exhausted() or time_budget_exceeded()
 
 def stop_reason_web_search():
+    if time_budget_exceeded():
+        return f"Run time budget ({MAX_RUNTIME_MINUTES} min) reached"
     if web_search_key_exhausted():
         return "The web-search API key has hit its daily quota"
     if brochure_keys_exhausted():
@@ -685,6 +718,7 @@ WEB_SEARCH_CONFIG = types.GenerateContentConfig(
 )
 
 def call_gemini_web_search_with_retry(user_prompt: str):
+    global _web_search_consecutive_failures
     for attempt in range(MAX_RETRIES):
         if web_search_key_exhausted():
             return None, "The web-search API key has hit its daily quota — stopping web-search audits for today."
@@ -693,6 +727,7 @@ def call_gemini_web_search_with_retry(user_prompt: str):
         try:
             time.sleep(SLEEP_BETWEEN_REQUESTS)
             response = web_search_client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=WEB_SEARCH_CONFIG)
+            _web_search_consecutive_failures = 0  # a success resets the streak
             return response.text, None
         except Exception as e:
             msg = str(e)
@@ -706,6 +741,17 @@ def call_gemini_web_search_with_retry(user_prompt: str):
                 time.sleep(delay)
             else:
                 return None, f"Gemini Web Search Error: {msg}"
+    # Every attempt in this call's own retry ladder failed. That alone isn't
+    # necessarily fatal (could be a one-off), but if this keeps happening
+    # call after call with zero successes in between, the key is
+    # persistently unusable right now even though nothing ever said "daily
+    # quota" -- this is exactly the pattern that caused a 4-hour runaway.
+    _web_search_consecutive_failures += 1
+    if _web_search_consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+        mark_web_search_key_exhausted(
+            reason=f"failed its full retry ladder {_web_search_consecutive_failures} times in a row "
+                   f"(persistent rate limiting, not a one-off)"
+        )
     return None, "Gemini Web Search Error: Exceeded Retries"
 
 def parse_retry_delay_seconds(err_msg: str):
@@ -718,6 +764,7 @@ def parse_retry_delay_seconds(err_msg: str):
     return None
 
 def call_gemini_with_retry(user_prompt: str):
+    global _brochure_consecutive_failures
     for attempt in range(MAX_RETRIES):
         if brochure_keys_exhausted():
             return None, "All brochure-audit API keys have hit their daily quota — stopping for today."
@@ -727,6 +774,7 @@ def call_gemini_with_retry(user_prompt: str):
         try:
             time.sleep(SLEEP_BETWEEN_REQUESTS)
             response = client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=GEN_CONFIG)
+            _brochure_consecutive_failures = 0  # a success resets the streak
             return response.text, None
         except Exception as e:
             msg = str(e)
@@ -743,6 +791,18 @@ def call_gemini_with_retry(user_prompt: str):
                 time.sleep(delay)
             else:
                 return None, f"Gemini API Error: {msg}"
+    # Same persistent-failure detection as the web-search path -- if every
+    # call keeps exhausting its full retry ladder with no successes, the
+    # active key is effectively unusable right now even without an explicit
+    # "daily quota" message. Try failing over first; only give up on the
+    # whole pool once there's nowhere left to fail over to.
+    _brochure_consecutive_failures += 1
+    if _brochure_consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+        _, key_idx = get_active_brochure_client()
+        if advance_brochure_key(key_idx):
+            _brochure_consecutive_failures = 0
+        # if advance_brochure_key returned False, brochure_keys_exhausted()
+        # is now True and the caller's stop-condition checks will catch it
     return None, "Gemini API Error: Exceeded Retries"
 
 def normalize_trim_key(name):
