@@ -102,20 +102,27 @@ def local(name):
 def _read_key(name):
     return os.environ.get(name, '').strip()
 
-# Three keys, two roles:
-#   - GEMINI_API_KEY  : dedicated to web-search/grounded calls (the no-brochure
-#     fallback audit + the cross-check pass's search step). Kept separate so
-#     that path's usage never eats into the brochure-audit keys' quota.
-#   - GEMINI_API_KEY_2, GEMINI_API_KEY_3 : the "usual" path -- every brochure
-#     audit call, plus the structured-JSON finalization step that follows a
-#     web search. Key 3 is an automatic failover: if key 2 hits ITS OWN daily
-#     quota, the script switches to key 3 for the rest of the run instead of
-#     stopping. GEMINI_API_KEY_3 is optional -- if unset, key 2 alone is used
-#     (no failover, same behavior as before this feature was added).
-WEB_SEARCH_API_KEY = _read_key('GEMINI_API_KEY')
-if not WEB_SEARCH_API_KEY:
-    raise RuntimeError("Set GEMINI_API_KEY (dedicated to web-search audits).")
-web_search_client = genai.Client(api_key=WEB_SEARCH_API_KEY)
+# Two roles, each backed by a POOL of keys rotated round-robin (not drained
+# one at a time) -- since each key is its own Google Cloud project with an
+# independent rate limit, using them one-at-a-time (the old behavior) meant
+# only ONE project's RPM budget was ever active at once, even with 5 idle
+# keys sitting there. Rotating across every non-exhausted key in a role
+# sustains roughly (working keys x per-key RPM) throughput instead.
+#
+#   - Web-search pool (GEMINI_API_KEY, GEMINI_API_KEY_WEB2, _WEB3, ...):
+#     grounded calls -- the no-brochure fallback + the cross-check pass's
+#     search step. This is usually the real bottleneck (grounding's free
+#     quota is much smaller than plain generation), so add more _WEB*
+#     keys here first if you want more throughput.
+#   - Brochure pool (GEMINI_API_KEY_2 .. GEMINI_API_KEY_6): every brochure
+#     audit call, plus the structured-JSON finalization step that follows
+#     a web search.
+_web_search_keys = [k for k in [
+    _read_key('GEMINI_API_KEY'), _read_key('GEMINI_API_KEY_WEB2'), _read_key('GEMINI_API_KEY_WEB3'),
+] if k]
+if not _web_search_keys:
+    raise RuntimeError("Set GEMINI_API_KEY (used for web-search audits).")
+web_search_clients = [genai.Client(api_key=k) for k in _web_search_keys]
 
 _brochure_keys = [k for k in [
     _read_key('GEMINI_API_KEY_2'), _read_key('GEMINI_API_KEY_3'),
@@ -162,11 +169,14 @@ SLEEP_BETWEEN_REQUESTS = 60.0 / RATE_LIMIT_RPM
 
 # Grounding (the Google Search tool used for web-search audits) has its own,
 # much smaller quota than plain structured generation -- public reports put
-# free-tier grounding as low as ~5 RPM / ~20 RPD, which is why sharing the
-# brochure pass's pacing was too aggressive and every web-search call was
-# hitting a wall immediately. Paced separately and far more conservatively.
+# UNBILLED free-tier grounding as low as ~5 RPM / ~20 RPD per project, even
+# when each key is its own separate project. Paced far more conservatively
+# than the brochure pass, and given fewer/faster retries below since there's
+# little point waiting a long time to rediscover the same hard wall.
 WEB_SEARCH_RATE_LIMIT_RPM = get_int_env('WEB_SEARCH_RATE_LIMIT_RPM', 4)
 WEB_SEARCH_SLEEP_BETWEEN_REQUESTS = 60.0 / WEB_SEARCH_RATE_LIMIT_RPM
+WEB_SEARCH_MAX_RETRIES = get_int_env('WEB_SEARCH_MAX_RETRIES', 3)
+WEB_SEARCH_MAX_BACKOFF_SECONDS = get_int_env('WEB_SEARCH_MAX_BACKOFF_SECONDS', 12)
 
 # This used to be the main thing that stopped a run (default 100, well under
 # any real Gemini quota) -- now that daily-quota rejections are detected
@@ -179,18 +189,14 @@ WEB_SEARCH_SLEEP_BETWEEN_REQUESTS = 60.0 / WEB_SEARCH_RATE_LIMIT_RPM
 DAILY_REQUEST_CAP = get_int_env('DAILY_REQUEST_CAP', 2000)
 
 # The ultimate safety net, independent of correctly diagnosing every
-# possible error shape from the API: no matter WHY things are going wrong
-# (a real daily quota, a much stricter RPM limit specifically on the
-# grounded-search tool that "PerDay"/"daily" text detection can't catch,
-# anything), the run must never just keep going until GitHub kills it after
-# its own job timeout. This is what actually caused the 4-hour runaway --
-# every single web-search call was hitting a persistent rate limit that
-# never said "daily", so the code kept retrying it as if each failure were
-# a fresh, unrelated, transient problem. Checked in every pass's stop
-# condition below.
+# possible error shape from the API: no matter WHY things are going wrong,
+# the run must never just keep going until GitHub kills it after its own job
+# timeout. Lowered to a much tighter default than before -- with grounding's
+# real quota this small, there's no benefit to a long run; a short run today
+# plus tomorrow's scheduled run gets through the backlog just as well with
+# far less wasted Action time per run.
 RUN_START_TIME = time.monotonic()
-MAX_RUNTIME_MINUTES = get_int_env('MAX_RUNTIME_MINUTES', 200)  # keep comfortably under the
-                                                                 # workflow's timeout-minutes (240)
+MAX_RUNTIME_MINUTES = get_int_env('MAX_RUNTIME_MINUTES', 45)
 
 def time_budget_exceeded():
     return (time.monotonic() - RUN_START_TIME) > (MAX_RUNTIME_MINUTES * 60)
@@ -202,8 +208,9 @@ def time_budget_exceeded():
 # says "daily quota". After this many consecutive full-retry failures, treat
 # the key as unusable for the rest of THIS run rather than hammering it
 # forever -- exactly like real daily-quota exhaustion, just detected by
-# behavior instead of by parsing error text.
-CONSECUTIVE_FAILURE_LIMIT = get_int_env('CONSECUTIVE_FAILURE_LIMIT', 5)
+# behavior instead of by parsing error text. Lowered from 5 to 3 so a truly
+# exhausted grounding quota gets recognized (and the pass stops) faster.
+CONSECUTIVE_FAILURE_LIMIT = get_int_env('CONSECUTIVE_FAILURE_LIMIT', 3)
 _web_search_consecutive_failures = 0
 _brochure_consecutive_failures = 0
 
@@ -321,73 +328,81 @@ def daily_cap_exhausted():
     with _daily_lock:
         return _daily_count >= DAILY_REQUEST_CAP
 
-# --- Per-key-pool quota tracking (separate from the DAILY_REQUEST_CAP budget
+# --- Per-key-pool round-robin (separate from the DAILY_REQUEST_CAP budget
 # above, which is a simple request-count safety ceiling regardless of which
-# key served it). This tracks whether Google itself has actually rejected a
-# key for exceeding ITS real daily quota, and drives automatic failover. ---
+# key served it). Rotates across every non-exhausted key in a role instead
+# of draining one key fully before touching the next -- since each key is
+# its own Google Cloud project with an independent rate limit, that's what
+# actually uses "all the APIs" instead of one at a time. ---
 
-_active_brochure_key_lock = threading.Lock()
-_active_brochure_key_index = 0
-_brochure_keys_exhausted = False
+class KeyPool:
+    def __init__(self, clients, role_name):
+        self.clients = clients
+        self.role_name = role_name
+        self._lock = threading.Lock()
+        self._next_index = 0
+        self._exhausted = set()
 
-def get_active_brochure_client():
-    with _active_brochure_key_lock:
-        return brochure_clients[_active_brochure_key_index], _active_brochure_key_index
+    def get_next(self):
+        """Returns (client, index) for the next non-exhausted key in
+        rotation, or (None, None) if every key in this pool is exhausted."""
+        with self._lock:
+            n = len(self.clients)
+            for _ in range(n):
+                idx = self._next_index
+                self._next_index = (self._next_index + 1) % n
+                if idx not in self._exhausted:
+                    return self.clients[idx], idx
+            return None, None
 
-def advance_brochure_key(failed_index):
-    """Called when the key at failed_index just hit its real daily quota.
-    Switches to the next configured key for all subsequent calls. Returns
-    False once every brochure-audit key has been exhausted."""
-    global _active_brochure_key_index, _brochure_keys_exhausted
-    with _active_brochure_key_lock:
-        if failed_index != _active_brochure_key_index:
-            return True  # another call already advanced past this key
-        if _active_brochure_key_index + 1 < len(brochure_clients):
-            _active_brochure_key_index += 1
-            print(f"[API key] Brochure-audit key {failed_index + 1} hit its daily quota — "
-                  f"switching to key {_active_brochure_key_index + 1}.")
-            return True
-        _brochure_keys_exhausted = True
-        print(f"[API key] All {len(brochure_clients)} brochure-audit key(s) have hit their daily quota.")
-        return False
+    def mark_exhausted(self, idx, reason="hit its daily quota"):
+        """Marks one key as unusable for the rest of this run. Returns True
+        if other keys in the pool are still available, False if this was
+        the last one."""
+        with self._lock:
+            if idx in self._exhausted:
+                return (len(self.clients) - len(self._exhausted)) > 0
+            self._exhausted.add(idx)
+            remaining = len(self.clients) - len(self._exhausted)
+            if remaining > 0:
+                print(f"[API key] {self.role_name} key {idx + 1} {reason} — "
+                      f"{remaining}/{len(self.clients)} key(s) still available in rotation.")
+            else:
+                print(f"[API key] All {len(self.clients)} {self.role_name.lower()} key(s) "
+                      f"have hit their daily quota.")
+            return remaining > 0
 
-def brochure_keys_exhausted():
-    return _brochure_keys_exhausted
+    def all_exhausted(self):
+        with self._lock:
+            return len(self._exhausted) >= len(self.clients)
 
-_web_search_key_exhausted = False
-
-def mark_web_search_key_exhausted(reason="hit its daily quota"):
-    global _web_search_key_exhausted
-    _web_search_key_exhausted = True
-    print(f"[API key] The web-search key {reason} — web-search audits and the "
-          "cross-check pass will stop for the rest of this run (brochure audits continue normally).")
-
-def web_search_key_exhausted():
-    return _web_search_key_exhausted
+brochure_pool = KeyPool(brochure_clients, "Brochure-audit")
+web_search_pool = KeyPool(web_search_clients, "Web-search")
 
 def should_stop_brochure_pass():
-    return daily_cap_exhausted() or brochure_keys_exhausted() or time_budget_exceeded()
+    return daily_cap_exhausted() or brochure_pool.all_exhausted() or time_budget_exceeded()
 
 def stop_reason_brochure():
     if time_budget_exceeded():
         return f"Run time budget ({MAX_RUNTIME_MINUTES} min) reached"
-    if brochure_keys_exhausted():
+    if brochure_pool.all_exhausted():
         return "All brochure-audit API keys have hit their daily quota"
     return f"Daily request cap ({DAILY_REQUEST_CAP}) reached"
 
 def should_stop_web_search_pass():
-    # This path needs BOTH the web-search key (for grounding) and a working
-    # brochure-pool key (for the structured-extraction step that follows the
-    # search) -- if either is gone, further attempts here would just fail
-    # one at a time instead of stopping cleanly.
-    return daily_cap_exhausted() or web_search_key_exhausted() or brochure_keys_exhausted() or time_budget_exceeded()
+    # This path needs BOTH a working web-search key (for grounding) and a
+    # working brochure-pool key (for the structured-extraction step that
+    # follows the search) -- if either pool is fully gone, further attempts
+    # here would just fail one at a time instead of stopping cleanly.
+    return (daily_cap_exhausted() or web_search_pool.all_exhausted()
+            or brochure_pool.all_exhausted() or time_budget_exceeded())
 
 def stop_reason_web_search():
     if time_budget_exceeded():
         return f"Run time budget ({MAX_RUNTIME_MINUTES} min) reached"
-    if web_search_key_exhausted():
-        return "The web-search API key has hit its daily quota"
-    if brochure_keys_exhausted():
+    if web_search_pool.all_exhausted():
+        return "All web-search API keys have hit their daily quota"
+    if brochure_pool.all_exhausted():
         return "All brochure-audit API keys have hit their daily quota (needed to finalize web-search results)"
     return f"Daily request cap ({DAILY_REQUEST_CAP}) reached"
 
@@ -727,39 +742,46 @@ WEB_SEARCH_CONFIG = types.GenerateContentConfig(
 
 def call_gemini_web_search_with_retry(user_prompt: str):
     global _web_search_consecutive_failures
-    for attempt in range(MAX_RETRIES):
-        if web_search_key_exhausted():
-            return None, "The web-search API key has hit its daily quota — stopping web-search audits for today."
+    last_key_idx = None
+    for attempt in range(WEB_SEARCH_MAX_RETRIES):
         if not daily_cap_try_consume():
             return None, f"Daily request cap ({DAILY_REQUEST_CAP}) reached — stopping for today."
+        client, key_idx = web_search_pool.get_next()
+        if client is None:
+            return None, "All web-search API keys have hit their daily quota — stopping web-search audits for today."
+        last_key_idx = key_idx
         try:
             time.sleep(WEB_SEARCH_SLEEP_BETWEEN_REQUESTS)
-            response = web_search_client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=WEB_SEARCH_CONFIG)
+            response = client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=WEB_SEARCH_CONFIG)
             _web_search_consecutive_failures = 0  # a success resets the streak
             return response.text, None
         except Exception as e:
             msg = str(e)
             is_daily_quota = "PerDay" in msg or "daily" in msg.lower()
             if is_daily_quota:
-                mark_web_search_key_exhausted()
-                return None, f"Gemini Web Search Daily Quota Error: {msg[:300]}"
+                if web_search_pool.mark_exhausted(key_idx):
+                    continue  # rotate to the next key immediately, same attempt budget
+                return None, f"Gemini Web Search Daily Quota Error (all web-search keys exhausted): {msg[:300]}"
             if any(code in msg for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
                 delay = parse_retry_delay_seconds(msg) or ((2 ** (attempt + 1)) + random.uniform(1, 2))
-                print(f"[Rate Limit - web search] attempt {attempt + 1}/{MAX_RETRIES}, waiting {delay:.1f}s...")
+                delay = min(delay, WEB_SEARCH_MAX_BACKOFF_SECONDS)
+                print(f"[Rate Limit - web search] attempt {attempt + 1}/{WEB_SEARCH_MAX_RETRIES}, waiting {delay:.1f}s...")
                 time.sleep(delay)
             else:
                 return None, f"Gemini Web Search Error: {msg}"
     # Every attempt in this call's own retry ladder failed. That alone isn't
     # necessarily fatal (could be a one-off), but if this keeps happening
-    # call after call with zero successes in between, the key is
-    # persistently unusable right now even though nothing ever said "daily
+    # call after call with zero successes in between, something is
+    # persistently wrong right now even though nothing ever said "daily
     # quota" -- this is exactly the pattern that caused a 4-hour runaway.
     _web_search_consecutive_failures += 1
-    if _web_search_consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
-        mark_web_search_key_exhausted(
-            reason=f"failed its full retry ladder {_web_search_consecutive_failures} times in a row "
-                   f"(persistent rate limiting, not a one-off)"
-        )
+    if _web_search_consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT and last_key_idx is not None:
+        if web_search_pool.mark_exhausted(
+            last_key_idx,
+            reason=f"failed its retry ladder {_web_search_consecutive_failures} times in a row "
+                   f"(persistent rate limiting, not a one-off)",
+        ):
+            _web_search_consecutive_failures = 0
     return None, "Gemini Web Search Error: Exceeded Retries"
 
 def parse_retry_delay_seconds(err_msg: str):
@@ -773,12 +795,14 @@ def parse_retry_delay_seconds(err_msg: str):
 
 def call_gemini_with_retry(user_prompt: str):
     global _brochure_consecutive_failures
+    last_key_idx = None
     for attempt in range(MAX_RETRIES):
-        if brochure_keys_exhausted():
-            return None, "All brochure-audit API keys have hit their daily quota — stopping for today."
         if not daily_cap_try_consume():
             return None, f"Daily request cap ({DAILY_REQUEST_CAP}) reached — stopping for today."
-        client, key_idx = get_active_brochure_client()
+        client, key_idx = brochure_pool.get_next()
+        if client is None:
+            return None, "All brochure-audit API keys have hit their daily quota — stopping for today."
+        last_key_idx = key_idx
         try:
             time.sleep(SLEEP_BETWEEN_REQUESTS)
             response = client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=GEN_CONFIG)
@@ -788,8 +812,8 @@ def call_gemini_with_retry(user_prompt: str):
             msg = str(e)
             is_daily_quota = "PerDay" in msg or "daily" in msg.lower()
             if is_daily_quota:
-                if advance_brochure_key(key_idx):
-                    continue  # retry immediately on the new key, same attempt budget
+                if brochure_pool.mark_exhausted(key_idx):
+                    continue  # rotate to the next key immediately, same attempt budget
                 return None, f"Gemini Daily Quota Error (all brochure keys exhausted): {msg[:300]}"
             if any(code in msg for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
                 delay = parse_retry_delay_seconds(msg)
@@ -802,15 +826,16 @@ def call_gemini_with_retry(user_prompt: str):
     # Same persistent-failure detection as the web-search path -- if every
     # call keeps exhausting its full retry ladder with no successes, the
     # active key is effectively unusable right now even without an explicit
-    # "daily quota" message. Try failing over first; only give up on the
-    # whole pool once there's nowhere left to fail over to.
+    # "daily quota" message. Rotate past it first; only give up on the whole
+    # pool once there's nowhere left to rotate to.
     _brochure_consecutive_failures += 1
-    if _brochure_consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
-        _, key_idx = get_active_brochure_client()
-        if advance_brochure_key(key_idx):
+    if _brochure_consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT and last_key_idx is not None:
+        if brochure_pool.mark_exhausted(
+            last_key_idx,
+            reason=f"failed its retry ladder {_brochure_consecutive_failures} times in a row "
+                   f"(persistent rate limiting, not a one-off)",
+        ):
             _brochure_consecutive_failures = 0
-        # if advance_brochure_key returned False, brochure_keys_exhausted()
-        # is now True and the caller's stop-condition checks will catch it
     return None, "Gemini API Error: Exceeded Retries"
 
 def normalize_trim_key(name):
