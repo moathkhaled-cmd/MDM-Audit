@@ -117,19 +117,51 @@ def _read_key(name):
 #   - Brochure pool (GEMINI_API_KEY_2 .. GEMINI_API_KEY_6): every brochure
 #     audit call, plus the structured-JSON finalization step that follows
 #     a web search.
-_web_search_keys = [k for k in [
-    _read_key('GEMINI_API_KEY'), _read_key('GEMINI_API_KEY_WEB2'), _read_key('GEMINI_API_KEY_WEB3'),
-] if k]
-if not _web_search_keys:
-    raise RuntimeError("Set GEMINI_API_KEY (used for web-search audits).")
-web_search_clients = [genai.Client(api_key=k) for k in _web_search_keys]
+# ============================================================
+# GEMINI API KEYS
+# ALL SIX KEYS are available to BOTH:
+#   1. Brochure/spec audits
+#   2. Web-search audits
+#
+# GitHub Secrets:
+#   GEMINI_API_KEY
+#   GEMINI_API_KEY_2
+#   GEMINI_API_KEY_3
+#   GEMINI_API_KEY_4
+#   GEMINI_API_KEY_5
+#   GEMINI_API_KEY_6
+# ============================================================
 
-_brochure_keys = [k for k in [
-    _read_key('GEMINI_API_KEY_2'), _read_key('GEMINI_API_KEY_3'),
-    _read_key('GEMINI_API_KEY_4'), _read_key('GEMINI_API_KEY_5'), _read_key('GEMINI_API_KEY_6'),
-] if k]
-if not _brochure_keys:
-    raise RuntimeError("Set at least GEMINI_API_KEY_2 (used for brochure audits).")
+_all_gemini_keys = [
+    _read_key('GEMINI_API_KEY'),
+    _read_key('GEMINI_API_KEY_2'),
+    _read_key('GEMINI_API_KEY_3'),
+    _read_key('GEMINI_API_KEY_4'),
+    _read_key('GEMINI_API_KEY_5'),
+    _read_key('GEMINI_API_KEY_6'),
+]
+
+_all_gemini_keys = [k for k in _all_gemini_keys if k]
+
+if not _all_gemini_keys:
+    raise RuntimeError(
+        "No Gemini API keys found. "
+        "Set GEMINI_API_KEY through GEMINI_API_KEY_6."
+    )
+
+print(f"[Gemini] Loaded {len(_all_gemini_keys)} API keys.")
+
+# EVERY key can perform web searches
+web_search_clients = [
+    genai.Client(api_key=k)
+    for k in _all_gemini_keys
+]
+
+# EVERY key can perform normal structured audits
+brochure_clients = [
+    genai.Client(api_key=k)
+    for k in _all_gemini_keys
+]
 brochure_clients = [genai.Client(api_key=k) for k in _brochure_keys]
 
 MODEL_NAME = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
