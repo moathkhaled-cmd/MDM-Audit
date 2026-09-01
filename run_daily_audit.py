@@ -160,6 +160,14 @@ SAVE_EVERY_N_GROUPS = get_int_env('SAVE_EVERY_N_GROUPS', 20)
 RATE_LIMIT_RPM = get_int_env('RATE_LIMIT_RPM', 10)
 SLEEP_BETWEEN_REQUESTS = 60.0 / RATE_LIMIT_RPM
 
+# Grounding (the Google Search tool used for web-search audits) has its own,
+# much smaller quota than plain structured generation -- public reports put
+# free-tier grounding as low as ~5 RPM / ~20 RPD, which is why sharing the
+# brochure pass's pacing was too aggressive and every web-search call was
+# hitting a wall immediately. Paced separately and far more conservatively.
+WEB_SEARCH_RATE_LIMIT_RPM = get_int_env('WEB_SEARCH_RATE_LIMIT_RPM', 4)
+WEB_SEARCH_SLEEP_BETWEEN_REQUESTS = 60.0 / WEB_SEARCH_RATE_LIMIT_RPM
+
 # This used to be the main thing that stopped a run (default 100, well under
 # any real Gemini quota) -- now that daily-quota rejections are detected
 # properly and failed over between keys (or stopped cleanly once ALL
@@ -725,7 +733,7 @@ def call_gemini_web_search_with_retry(user_prompt: str):
         if not daily_cap_try_consume():
             return None, f"Daily request cap ({DAILY_REQUEST_CAP}) reached — stopping for today."
         try:
-            time.sleep(SLEEP_BETWEEN_REQUESTS)
+            time.sleep(WEB_SEARCH_SLEEP_BETWEEN_REQUESTS)
             response = web_search_client.models.generate_content(model=MODEL_NAME, contents=user_prompt, config=WEB_SEARCH_CONFIG)
             _web_search_consecutive_failures = 0  # a success resets the streak
             return response.text, None
