@@ -434,6 +434,26 @@ class KeyPool:
 brochure_pool = KeyPool(brochure_clients, 'Brochure-audit', RATE_LIMIT_RPM)
 web_search_pool = KeyPool(web_search_clients, 'Web-search', WEB_SEARCH_RATE_LIMIT_RPM)
 
+def print_gemini_usage_summary():
+    """Print per-key Gemini request usage for this run."""
+    print("\n================ GEMINI USAGE SUMMARY ================")
+
+    brochure_stats = brochure_pool.stats()
+    web_stats = web_search_pool.stats()
+
+    print(f"Total Gemini API requests counted: {_daily_count}")
+    print("\nBrochure / structured-audit pool:")
+    for key_num, data in brochure_stats.items():
+        status = "EXHAUSTED" if data['exhausted'] else "available"
+        print(f"  Key {key_num}: {data['requests']} request(s) — {status}")
+
+    print("\nWeb-search / grounding pool:")
+    for key_num, data in web_stats.items():
+        status = "EXHAUSTED" if data['exhausted'] else "available"
+        print(f"  Key {key_num}: {data['requests']} request(s) — {status}")
+
+    print("========================================================\n")
+
 def should_stop_brochure_pass():
     return daily_cap_exhausted() or brochure_pool.all_exhausted() or time_budget_exceeded()
 
@@ -1599,8 +1619,8 @@ def run_pipeline():
     print_gemini_usage_summary()
 
     if stopped_early:
-        print(f"\nStopped after {group_count}/{total_groups} groups this run (daily cap). "
-              f"Tomorrow's scheduled GitHub Actions run picks up automatically.")
+        print(f"\nStopped after {group_count}/{total_groups} groups this run. "
+              f"The next scheduled GitHub Actions run will continue automatically.")
     elif unaudited_count:
         print(f"\n{unaudited_count} row(s) still unaudited (likely a PDF read/parse issue) — "
               f"see {NOT_YET_AUDITED_NAME}.")
