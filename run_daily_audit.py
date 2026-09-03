@@ -99,26 +99,18 @@ def local(name):
 def _read_key(name):
     return os.environ.get(name, '').strip()
 
-# Two roles, each backed by a POOL of keys rotated round-robin (not drained
-# one at a time) -- since each key is its own Google Cloud project with an
-# independent rate limit, using them one-at-a-time (the old behavior) meant
-# only ONE project's RPM budget was ever active at once, even with 5 idle
-# keys sitting there. Rotating across every non-exhausted key in a role
-# sustains roughly (working keys x per-key RPM) throughput instead.
-#
-#   - Web-search pool (GEMINI_API_KEY, GEMINI_API_KEY_WEB2, _WEB3, ...):
-#     grounded calls -- the no-brochure fallback + the cross-check pass's
-#     search step. This is usually the real bottleneck (grounding's free
-#     quota is much smaller than plain generation), so add more _WEB*
-#     keys here first if you want more throughput.
-#   - Brochure pool (GEMINI_API_KEY_2 .. GEMINI_API_KEY_6): every brochure
-#     audit call, plus the structured-JSON finalization step that follows
-#     a web search.
 # ============================================================
-# GEMINI API KEYS
-# ALL SIX KEYS are available to BOTH:
-#   1. Brochure/spec audits
-#   2. Web-search audits
+# GEMINI API KEYS -- ONE unified pool, shared by both operations
+# ============================================================
+# All 6 keys draw from a SINGLE KeyPool instance used by both brochure
+# audits and web-search audits. This replaces an earlier version that built
+# two separate pools (brochure_pool / web_search_pool) out of the same 6
+# keys wrapped in duplicate Client objects -- that meant each key's real
+# quota usage was tracked in two disconnected places, so a key cooling down
+# from heavy brochure use would look "fully available" to the web-search
+# side even though it's the same underlying Google Cloud project consuming
+# one real quota. One pool = one accurate picture of each key's actual
+# current usage, regardless of which operation is asking for it.
 #
 # GitHub Secrets:
 #   GEMINI_API_KEY
@@ -146,19 +138,11 @@ if not _all_gemini_keys:
         "Set GEMINI_API_KEY through GEMINI_API_KEY_6."
     )
 
-print(f"[Gemini] Loaded {len(_all_gemini_keys)} API keys.")
+print(f"[Gemini] Loaded {len(_all_gemini_keys)} API key(s), shared across brochure and web-search audits.")
 
-# EVERY key can perform web searches
-web_search_clients = [
-    genai.Client(api_key=k)
-    for k in _all_gemini_keys
-]
+# ONE client per key -- not duplicated per role.
+gemini_clients = [genai.Client(api_key=k) for k in _all_gemini_keys]
 
-# EVERY key can perform normal structured audits
-brochure_clients = [
-    genai.Client(api_key=k)
-    for k in _all_gemini_keys
-]
 MODEL_NAME = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
 
 MAX_TEXT_CHARS = 40_000
@@ -413,13 +397,20 @@ class KeyPool:
                 return None, None, None
             return self.clients[best_idx], best_idx, best_wait
 
-    def record_request(self, idx):
+    def record_request(self, idx, interval=None):
         with self._lock:
             self.request_counts[idx] += 1
-            # Enforce pacing per project/key, not globally.
+            # Enforce pacing per project/key, not globally. `interval`
+            # lets a caller apply its OWN pacing (e.g. web-search's much
+            # slower grounding-quota pace) to this key's shared cooldown
+            # clock, rather than always using the pool's default -- since
+            # it's the same real per-project quota regardless of which
+            # operation is consuming it, whichever operation just used the
+            # key sets how long until it's available again for BOTH.
+            eff_interval = self.interval if interval is None else interval
             self._next_available[idx] = max(
                 self._next_available[idx], time.monotonic()
-            ) + self.interval
+            ) + eff_interval
 
     def record_success(self, idx):
         with self._lock:
@@ -486,30 +477,27 @@ class KeyPool:
                     f"{status}"
                 )
 
-brochure_pool = KeyPool(brochure_clients, "Brochure-audit", RATE_LIMIT_RPM)
-web_search_pool = KeyPool(web_search_clients, "Web-search", WEB_SEARCH_RATE_LIMIT_RPM)
+gemini_pool = KeyPool(gemini_clients, "Gemini", RATE_LIMIT_RPM)
 
 def should_stop_brochure_pass():
-    return daily_cap_exhausted() or brochure_pool.all_exhausted() or time_budget_exceeded()
+    return daily_cap_exhausted() or gemini_pool.all_exhausted() or time_budget_exceeded()
 
 def stop_reason_brochure():
     if time_budget_exceeded():
         return f"Run time budget ({MAX_RUNTIME_MINUTES} min) reached"
-    if brochure_pool.all_exhausted():
-        return "All brochure-audit projects have explicitly hit their daily quota"
+    if gemini_pool.all_exhausted():
+        return "All Gemini API keys have explicitly hit their daily quota"
     return f"Daily request cap ({DAILY_REQUEST_CAP}) reached"
 
 def should_stop_web_search_pass():
-    return (daily_cap_exhausted() or web_search_pool.all_exhausted()
-            or brochure_pool.all_exhausted() or time_budget_exceeded())
+    # Same shared pool serves both roles now, so one check covers both.
+    return daily_cap_exhausted() or gemini_pool.all_exhausted() or time_budget_exceeded()
 
 def stop_reason_web_search():
     if time_budget_exceeded():
         return f"Run time budget ({MAX_RUNTIME_MINUTES} min) reached"
-    if web_search_pool.all_exhausted():
-        return "All web-search projects have explicitly hit their daily quota"
-    if brochure_pool.all_exhausted():
-        return "All brochure-audit projects have explicitly hit their daily quota (needed to finalize web-search results)"
+    if gemini_pool.all_exhausted():
+        return "All Gemini API keys have explicitly hit their daily quota"
     return f"Daily request cap ({DAILY_REQUEST_CAP}) reached"
 
 def values_differ(old_val, new_val):
@@ -907,27 +895,29 @@ def call_gemini_web_search_with_retry(user_prompt: str):
                 "stopping for today."
             )
 
-        client, key_idx, wait_time = web_search_pool.get_next()
+        client, key_idx, wait_time = gemini_pool.get_next()
 
         if client is None:
             return None, (
-                "All web-search API projects have explicitly exhausted "
+                "All Gemini API keys have explicitly exhausted "
                 "their daily quota."
             )
 
         if wait_time and wait_time > 0:
             print(
-                f"[Gemini Web-search] key {key_idx + 1}/{len(web_search_clients)} "
+                f"[Gemini Web-search] key {key_idx + 1}/{len(gemini_clients)} "
                 f"cooldown {wait_time:.1f}s"
             )
             time.sleep(wait_time)
 
-        web_search_pool.record_request(key_idx)
+        # Web-search's own (slower) pacing is applied to this key's SHARED
+        # cooldown clock -- see KeyPool.record_request's interval param.
+        gemini_pool.record_request(key_idx, interval=60.0 / WEB_SEARCH_RATE_LIMIT_RPM)
 
         print(
-            f"[Gemini Web-search] key {key_idx + 1}/{len(web_search_clients)} "
+            f"[Gemini Web-search] key {key_idx + 1}/{len(gemini_clients)} "
             f"used — this-run requests: "
-            f"{web_search_pool.request_counts[key_idx]}"
+            f"{gemini_pool.request_counts[key_idx]}"
         )
 
         try:
@@ -937,10 +927,10 @@ def call_gemini_web_search_with_retry(user_prompt: str):
                 config=WEB_SEARCH_CONFIG,
             )
 
-            web_search_pool.record_success(key_idx)
+            gemini_pool.record_success(key_idx)
 
             print(
-                f"[Gemini Web-search] key {key_idx + 1}/{len(web_search_clients)} "
+                f"[Gemini Web-search] key {key_idx + 1}/{len(gemini_clients)} "
                 "SUCCESS"
             )
 
@@ -948,13 +938,13 @@ def call_gemini_web_search_with_retry(user_prompt: str):
 
         except Exception as e:
             msg = str(e)
-            web_search_pool.record_failure(key_idx)
+            gemini_pool.record_failure(key_idx)
 
             # ------------------------------------------------------------
             # 1. REAL DAILY QUOTA
             # ------------------------------------------------------------
             if _is_explicit_daily_quota(msg):
-                web_search_pool.mark_daily_quota(
+                gemini_pool.mark_daily_quota(
                     key_idx,
                     reason="explicit daily/project quota error"
                 )
@@ -982,14 +972,14 @@ def call_gemini_web_search_with_retry(user_prompt: str):
                     )
 
                 # Cool only this project.
-                web_search_pool.cooldown(
+                gemini_pool.cooldown(
                     key_idx,
                     retry_delay
                 )
 
                 print(
                     f"[Rate Limit - web search] key "
-                    f"{key_idx + 1}/{len(web_search_clients)} "
+                    f"{key_idx + 1}/{len(gemini_clients)} "
                     f"attempt {attempt + 1}/{WEB_SEARCH_MAX_RETRIES}; "
                     f"cooling this project for {retry_delay:.1f}s; "
                     "rotating to another project."
@@ -1036,29 +1026,29 @@ def call_gemini_with_retry(user_prompt: str):
                 "stopping for today."
             )
 
-        client, key_idx, wait_time = brochure_pool.get_next()
+        client, key_idx, wait_time = gemini_pool.get_next()
 
         if client is None:
             return None, (
-                "All brochure-audit API projects have explicitly "
-                "exhausted their daily quota."
+                "All Gemini API keys have explicitly exhausted "
+                "their daily quota."
             )
 
         if wait_time and wait_time > 0:
             print(
                 f"[Gemini Brochure-audit] key "
-                f"{key_idx + 1}/{len(brochure_clients)} "
+                f"{key_idx + 1}/{len(gemini_clients)} "
                 f"cooldown {wait_time:.1f}s"
             )
             time.sleep(wait_time)
 
-        brochure_pool.record_request(key_idx)
+        gemini_pool.record_request(key_idx, interval=60.0 / RATE_LIMIT_RPM)
 
         print(
             f"[Gemini Brochure-audit] key "
-            f"{key_idx + 1}/{len(brochure_clients)} "
+            f"{key_idx + 1}/{len(gemini_clients)} "
             f"used — this-run requests: "
-            f"{brochure_pool.request_counts[key_idx]}"
+            f"{gemini_pool.request_counts[key_idx]}"
         )
 
         try:
@@ -1068,24 +1058,24 @@ def call_gemini_with_retry(user_prompt: str):
                 config=GEN_CONFIG,
             )
 
-            brochure_pool.record_success(key_idx)
+            gemini_pool.record_success(key_idx)
 
             print(
                 f"[Gemini Brochure-audit] key "
-                f"{key_idx + 1}/{len(brochure_clients)} SUCCESS"
+                f"{key_idx + 1}/{len(gemini_clients)} SUCCESS"
             )
 
             return response.text, None
 
         except Exception as e:
             msg = str(e)
-            brochure_pool.record_failure(key_idx)
+            gemini_pool.record_failure(key_idx)
 
             # ------------------------------------------------------------
             # 1. REAL DAILY QUOTA
             # ------------------------------------------------------------
             if _is_explicit_daily_quota(msg):
-                brochure_pool.mark_daily_quota(
+                gemini_pool.mark_daily_quota(
                     key_idx,
                     reason="explicit daily/project quota error"
                 )
@@ -1111,14 +1101,14 @@ def call_gemini_with_retry(user_prompt: str):
                         MAX_BACKOFF_SECONDS,
                     )
 
-                brochure_pool.cooldown(
+                gemini_pool.cooldown(
                     key_idx,
                     retry_delay
                 )
 
                 print(
                     f"[Rate Limit] key "
-                    f"{key_idx + 1}/{len(brochure_clients)} "
+                    f"{key_idx + 1}/{len(gemini_clients)} "
                     f"attempt {attempt + 1}/{MAX_RETRIES}; "
                     f"cooling this project for {retry_delay:.1f}s; "
                     "rotating to another project."
@@ -1584,8 +1574,7 @@ def print_gemini_usage_summary():
     print("GEMINI API USAGE SUMMARY")
     print("=" * 72)
     print(f"Global request counter: {_daily_count}/{DAILY_REQUEST_CAP}")
-    brochure_pool.print_stats()
-    web_search_pool.print_stats()
+    gemini_pool.print_stats()
     print("=" * 72)
 
 
