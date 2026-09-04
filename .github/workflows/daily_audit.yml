@@ -4,13 +4,22 @@ on:
   schedule:
     # 06:00 UTC daily = 10:00 AM UAE/KSA (UTC+4). Adjust the hour to taste —
     # GitHub's cron can run a few minutes late, that's normal.
-    - cron: '0 6 * * *'
+    - cron: '0 4 * * *'
   workflow_dispatch: {}   # adds a "Run workflow" button in the Actions tab for manual runs
 
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    # MUST stay comfortably ABOVE run_daily_audit.py's own MAX_RUNTIME_MINUTES
+    # (default 60, overridable via the MAX_RUNTIME_MINUTES repo variable
+    # below) -- that internal check is what makes the script stop cleanly
+    # and save; if this external timeout is lower (or too close), GitHub
+    # force-cancels the job first, which skips the clean save entirely. A
+    # run that hit exactly "4h0m0s exceeded" happened because this used to
+    # be 240 while the script's own budget was set to 330 -- the reverse of
+    # what's needed. Keep at least ~20-30 min of headroom above whatever
+    # MAX_RUNTIME_MINUTES is set to.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +47,8 @@ jobs:
           GDRIVE_BROCHURES_FOLDER_ID: ${{ secrets.GDRIVE_BROCHURES_FOLDER_ID }}
           DAILY_REQUEST_CAP: ${{ vars.DAILY_REQUEST_CAP }}
           RATE_LIMIT_RPM: ${{ vars.RATE_LIMIT_RPM }}
+          MAX_TEXT_CHARS: ${{ vars.MAX_TEXT_CHARS }}
+          GROUP_BATCH_SIZE: ${{ vars.GROUP_BATCH_SIZE }}
         run: python run_daily_audit.py
 
       - name: Remove credentials
