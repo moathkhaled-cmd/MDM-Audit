@@ -145,8 +145,6 @@ gemini_clients = [genai.Client(api_key=k) for k in _all_gemini_keys]
 
 MODEL_NAME = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
 
-MAX_TEXT_CHARS = 40_000
-GROUP_BATCH_SIZE = 10
 MAX_RETRIES = 5
 
 def get_int_env(name, default):
@@ -177,6 +175,21 @@ SAVE_EVERY_N_GROUPS = get_int_env('SAVE_EVERY_N_GROUPS', 20)
 RATE_LIMIT_RPM = get_int_env('RATE_LIMIT_RPM', 10)
 WEB_SEARCH_RATE_LIMIT_RPM = get_int_env('WEB_SEARCH_RATE_LIMIT_RPM', 4)
 
+# Trimmed from 40,000 -- this is the input-token dominant cost per brochure
+# call (a brochure's PDF text, head+tail smart-truncated, gets sent on
+# every call for that brochure's group). Lower default cuts input tokens
+# per call meaningfully without losing the head+tail coverage (overview +
+# spec tables, usually near the end) that matters most for accuracy.
+MAX_TEXT_CHARS = get_int_env('MAX_TEXT_CHARS', 24_000)
+
+# Raised from 10 -- more trims batched into ONE call means fewer total
+# calls for brochures covering many trims, which is the lever that actually
+# reduces REQUEST COUNT (the thing that runs out, per-project RPD) rather
+# than just token volume. The brochure text is sent once per call either
+# way, so batching more trims per call is close to free in token terms but
+# directly cuts how many separate requests a large brochure group needs.
+GROUP_BATCH_SIZE = get_int_env('GROUP_BATCH_SIZE', 16)
+
 # Maximum attempts for one logical request. A 429/503 rotates to another key
 # instead of declaring the current key dead.
 WEB_SEARCH_MAX_RETRIES = get_int_env('WEB_SEARCH_MAX_RETRIES', 6)
@@ -197,12 +210,14 @@ DAILY_REQUEST_CAP = get_int_env('DAILY_REQUEST_CAP', 10000)
 # The ultimate safety net, independent of correctly diagnosing every
 # possible error shape from the API: no matter WHY things are going wrong,
 # the run must never just keep going until GitHub kills it after its own job
-# timeout. Lowered to a much tighter default than before -- with grounding's
-# real quota this small, there's no benefit to a long run; a short run today
-# plus tomorrow's scheduled run gets through the backlog just as well with
-# far less wasted Action time per run.
+# timeout. THIS MUST STAY WELL UNDER the workflow's timeout-minutes
+# (currently 240 in daily_audit.yml) -- a run that got stuck for over 4
+# hours and had to be force-cancelled by GitHub happened because this was
+# set to 330, ABOVE the 240-minute job timeout, so the internal check could
+# never fire before GitHub killed the job first. Lowered well below it, with
+# real margin for the save/upload steps at the end.
 RUN_START_TIME = time.monotonic()
-MAX_RUNTIME_MINUTES = get_int_env('MAX_RUNTIME_MINUTES', 330)
+MAX_RUNTIME_MINUTES = get_int_env('MAX_RUNTIME_MINUTES', 60)
 
 def time_budget_exceeded():
     return (time.monotonic() - RUN_START_TIME) > (MAX_RUNTIME_MINUTES * 60)
