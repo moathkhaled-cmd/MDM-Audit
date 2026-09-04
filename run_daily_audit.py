@@ -1414,24 +1414,29 @@ def is_retryable_status(status) -> bool:
         return True
     return any(s.startswith(p) for p in NOT_YET_AUDITED_PREFIXES)
 
-def is_hollow_mismatch(status, discrepancy_note) -> bool:
-    """A 'Flagged: Mismatched Brochure PDF' row is normally a real, final
-    verdict -- Gemini read the PDF and confirmed it's for a different
-    vehicle, with a note saying what it actually found. But if that note is
-    empty, the mismatch verdict itself never actually completed properly
-    (an interrupted run, an old code path, etc.) -- the row was marked
-    'Audited' with no real data behind it at all, brochure or otherwise.
-    Treat that combination as needing a fresh audit, same as if it had no
-    brochure match in the first place."""
-    if str(status) != "Flagged: Mismatched Brochure PDF":
-        return False
-    return pd.isna(discrepancy_note) or str(discrepancy_note).strip() == ""
+# Statuses meaning "no trustworthy brochure text was ever actually used to
+# verify this row's specs" -- either no brochure was matched at all, or one
+# WAS matched (Brochure_File_Found is True) but turned out unusable: wrong
+# vehicle, unreadable, or tied between multiple candidates. Every one of
+# these is functionally the same situation as "no brochure exists" and
+# deserves the same full AI-sourced audit via web search, rather than
+# sitting permanently marked 'Audited' with zero real, verified data behind
+# it. The deliberate exclusion is 'Missing Make/Model in Sheet' -- there's
+# nothing to search for until a human fixes the source row's identity.
+NO_USABLE_BROCHURE_STATUSES = {
+    "Flagged: Mismatched Brochure PDF",
+    "Flagged: Image-Only or Unreadable PDF",
+    "Flagged: Ambiguous Brochure Match",
+}
+
+def has_no_usable_brochure(status) -> bool:
+    return str(status) in NO_USABLE_BROCHURE_STATUSES
 
 def refresh_audit_progress():
     df['Audit_Progress'] = df.apply(
         lambda r: "Pending" if (
             is_retryable_status(r.get('Accuracy_Status'))
-            or is_hollow_mismatch(r.get('Accuracy_Status'), r.get('Discrepancies_Flagged'))
+            or has_no_usable_brochure(r.get('Accuracy_Status'))
         ) else "Audited",
         axis=1,
     )
@@ -1654,31 +1659,40 @@ def run_pipeline():
     # it produces get queued for the same second-confirmation pass, not just
     # the ones from the brochure loop above.
     #
-    # This also catches "hollow mismatch" rows: Brochure_File_Found is True
-    # for these (a PDF WAS matched by filename), so they'd otherwise be
-    # invisible to a plain "no brochure" filter -- but if the mismatch
-    # verdict has no explanation behind it, that PDF is unusable and the
-    # row has effectively never been audited from anything. Routing it
-    # through web search here means it gets real, sourced data instead of
-    # staying permanently stuck on a broken verdict. ---
+    # This also catches every row with NO USABLE brochure behind its status
+    # (see has_no_usable_brochure): Brochure_File_Found is True for these
+    # (a PDF WAS matched by filename), so they'd otherwise be invisible to
+    # a plain "no brochure" filter -- but a mismatched, unreadable, or
+    # ambiguously-matched brochure means the row's specs were never
+    # actually verified from anything. Routing it through web search here
+    # means it gets real, sourced data instead of staying permanently stuck
+    # on a dead-end verdict. ---
     needs_websearch_mask = (
         (df['Brochure_File_Found'] != True) & (df['Accuracy_Status'].apply(is_retryable_status))
-    ) | df.apply(lambda r: is_hollow_mismatch(r.get('Accuracy_Status'), r.get('Discrepancies_Flagged')), axis=1)
+    ) | df['Accuracy_Status'].apply(has_no_usable_brochure)
     no_brochure_df = df[needs_websearch_mask]
+
     grouped_by_vehicle = {}
     for idx, row in no_brochure_df.iterrows():
         key = (row.get(MAKE_COL), row.get(MODEL_COL), row.get(GEN_COL))
         grouped_by_vehicle.setdefault(key, []).append((idx, df.loc[idx]))
 
+    # Highest-impact vehicles first: with a limited daily budget for this
+    # pass, auditing the vehicle blocking the most rows first gets more
+    # actual rows covered per run than processing in arbitrary sheet order.
+    grouped_by_vehicle = dict(sorted(grouped_by_vehicle.items(), key=lambda kv: -len(kv[1])))
+
     total_web_groups = len(grouped_by_vehicle)
-    hollow_mismatch_count = int(df.apply(
-        lambda r: is_hollow_mismatch(r.get('Accuracy_Status'), r.get('Discrepancies_Flagged')), axis=1
-    ).sum())
+    stuck_status_counts = df.loc[
+        df['Accuracy_Status'].apply(has_no_usable_brochure), 'Accuracy_Status'
+    ].value_counts().to_dict()
     if total_web_groups:
-        extra = f" (including {hollow_mismatch_count} row(s) stuck on an unexplained mismatch verdict)" \
-            if hollow_mismatch_count else ""
+        extra = ""
+        if stuck_status_counts:
+            breakdown = ", ".join(f"{c} {s.replace('Flagged: ', '')}" for s, c in stuck_status_counts.items())
+            extra = f" (including rows stuck on: {breakdown})"
         print(f"\n{total_web_groups} vehicle(s) need a web-search audit{extra} — "
-              f"attempting as many as today's remaining cap allows.")
+              f"processing highest-impact (most rows) first, as many as today's remaining cap allows.")
 
     web_group_count = 0
     for (make, model, gen), g_rows in grouped_by_vehicle.items():
