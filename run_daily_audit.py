@@ -155,7 +155,7 @@ if _aq_prefix_keys:
 # ONE client per key -- not duplicated per role.
 gemini_clients = [genai.Client(api_key=k) for k in _all_gemini_keys]
 
-MODEL_NAME = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
+MODEL_NAME = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 
 MAX_RETRIES = 5
 
