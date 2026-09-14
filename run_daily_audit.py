@@ -140,6 +140,18 @@ if not _all_gemini_keys:
 
 print(f"[Gemini] Loaded {len(_all_gemini_keys)} API key(s), shared across brochure and web-search audits.")
 
+_aq_prefix_keys = [i + 1 for i, k in enumerate(_all_gemini_keys) if k.startswith('AQ.')]
+if _aq_prefix_keys:
+    print(
+        f"[Gemini] *** WARNING: key(s) #{_aq_prefix_keys} use the new 'AQ.' prefix format. "
+        f"There is a known, currently-unresolved Google-side bug where these are rejected with "
+        f"401 UNAUTHENTICATED / ACCESS_TOKEN_TYPE_UNSUPPORTED on this API endpoint, unrelated to "
+        f"anything in this script or how the key was configured. If you see that error during "
+        f"this run, this is almost certainly why -- see "
+        f"https://discuss.ai.google.dev/t/aq-key-401-access-token-type-unsupported-fully-configured-key-still-rejected/172852 "
+        f"An older 'AIza...'-format key, if you have one, is a working stopgap in the meantime. ***"
+    )
+
 # ONE client per key -- not duplicated per role.
 gemini_clients = [genai.Client(api_key=k) for k in _all_gemini_keys]
 
@@ -494,6 +506,42 @@ class KeyPool:
 
 gemini_pool = KeyPool(gemini_clients, "Gemini", RATE_LIMIT_RPM)
 
+# Independent of per-key daily-quota tracking above: if web-search calls are
+# failing almost universally (near-0% success), that's evidence the real
+# grounding quota is being hit near-instantly each day -- observed directly
+# across 3 days where ~1,500 web-search attempts/day failed with "maximum
+# retry attempts reached" while Verified Accurate / Spec Discrepancy counts
+# never moved, and per-key daily-quota detection barely fired even once.
+# Retrying that many times against a wall that isn't opening wastes the
+# whole run's time budget AND hammers the same shared keys the brochure
+# pass needs, likely starving it too. Once this many TOTAL web-search calls
+# have failed their full retry ladder in one run (regardless of which key),
+# stop attempting web search for the rest of THIS run entirely -- the
+# brochure pass keeps going on the same keys, unaffected.
+WEB_SEARCH_GIVE_UP_THRESHOLD = get_int_env('WEB_SEARCH_GIVE_UP_THRESHOLD', 15)
+_web_search_total_failures = 0
+_web_search_given_up = False
+
+def web_search_given_up():
+    return _web_search_given_up
+
+def record_web_search_total_failure():
+    global _web_search_total_failures, _web_search_given_up
+    _web_search_total_failures += 1
+    if _web_search_total_failures >= WEB_SEARCH_GIVE_UP_THRESHOLD and not _web_search_given_up:
+        _web_search_given_up = True
+        print(
+            f"[Web Search] *** {_web_search_total_failures} web-search calls have failed their "
+            f"full retry ladder this run with almost no successes -- this pattern (near-0% "
+            f"success, per-key daily-quota rarely triggering) means the real grounding quota is "
+            f"almost certainly being exhausted within seconds of the run starting each day. "
+            f"Giving up on web-search-dependent passes for the REST of this run so the brochure "
+            f"pass isn't starved of the same shared keys chasing a wall that won't open today. "
+            f"If this keeps happening every run, the fix is enabling billing on these projects "
+            f"(1,500/day free grounding allowance per project on paid tier vs. a much smaller "
+            f"unbilled allowance), not further retry tuning. ***"
+        )
+
 def should_stop_brochure_pass():
     return daily_cap_exhausted() or gemini_pool.all_exhausted() or time_budget_exceeded()
 
@@ -506,9 +554,13 @@ def stop_reason_brochure():
 
 def should_stop_web_search_pass():
     # Same shared pool serves both roles now, so one check covers both.
-    return daily_cap_exhausted() or gemini_pool.all_exhausted() or time_budget_exceeded()
+    return (daily_cap_exhausted() or gemini_pool.all_exhausted()
+            or time_budget_exceeded() or web_search_given_up())
 
 def stop_reason_web_search():
+    if web_search_given_up():
+        return (f"Web search gave up after {_web_search_total_failures} failed calls this run "
+                 f"(near-0% success rate — see the [Web Search] warning above)")
     if time_budget_exceeded():
         return f"Run time budget ({MAX_RUNTIME_MINUTES} min) reached"
     if gemini_pool.all_exhausted():
@@ -890,6 +942,22 @@ def _is_retryable_rate_error(msg: str) -> bool:
     ))
 
 
+def _is_broken_credential(msg: str) -> bool:
+    """
+    True for a genuinely invalid/unusable API key -- 401 UNAUTHENTICATED
+    with ACCESS_TOKEN_TYPE_UNSUPPORTED (or plain UNAUTHENTICATED). This is
+    NOT a rate limit and retrying it will never succeed: it means the key
+    itself was rejected, most commonly right now because of a known,
+    currently-unresolved Google-side issue where newly-issued "AQ." prefix
+    API keys (AI Studio's new key format, replacing the old "AIza..."
+    format) are rejected by the generativelanguage.googleapis.com endpoint.
+    See: https://discuss.ai.google.dev/t/aq-key-401-access-token-type-unsupported-fully-configured-key-still-rejected/172852
+    Flagged loudly and distinctly so it's never mistaken for a quota issue
+    or a one-off transient error worth retrying.
+    """
+    s = str(msg).upper()
+    return "UNAUTHENTICATED" in s or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in s
+
 
 
 
@@ -904,6 +972,12 @@ def call_gemini_web_search_with_retry(user_prompt: str):
       - No false "key exhausted" after a few retries.
     """
     for attempt in range(WEB_SEARCH_MAX_RETRIES):
+        if web_search_given_up():
+            return None, (
+                "Gemini Web Search Error: web search gave up for the rest of this run "
+                "(near-0% success rate detected — see the [Web Search] warning in the log)."
+            )
+
         if not daily_cap_try_consume():
             return None, (
                 f"Daily request cap ({DAILY_REQUEST_CAP}) reached — "
@@ -973,6 +1047,27 @@ def call_gemini_web_search_with_retry(user_prompt: str):
                 continue
 
             # ------------------------------------------------------------
+            # 1b. BROKEN / REJECTED CREDENTIAL (not a rate limit -- retrying
+            # this key will never succeed). See _is_broken_credential's
+            # docstring for the current known cause (AQ.-format key issue).
+            # ------------------------------------------------------------
+            if _is_broken_credential(msg):
+                gemini_pool.mark_daily_quota(
+                    key_idx,
+                    reason="was REJECTED (401 UNAUTHENTICATED / invalid credential -- "
+                           "not a quota issue, see run header for details)"
+                )
+                print(
+                    f"[Gemini Web-search] *** key {key_idx + 1} has an INVALID/REJECTED "
+                    f"credential (401 UNAUTHENTICATED) -- this is NOT a rate limit or quota "
+                    f"issue. Most likely cause right now: a known Google-side bug affecting "
+                    f"newly-issued 'AQ.'-prefix API keys. Check whether this key starts with "
+                    f"'AQ.' vs the older 'AIza...' format in AI Studio. Removed from rotation "
+                    f"for the rest of this run. ***"
+                )
+                continue
+
+            # ------------------------------------------------------------
             # 2. TEMPORARY RATE LIMIT / SERVICE ISSUE
             # ------------------------------------------------------------
             if _is_retryable_rate_error(msg):
@@ -1011,6 +1106,7 @@ def call_gemini_web_search_with_retry(user_prompt: str):
                 f"Gemini Web Search Error: {msg[:1000]}"
             )
 
+    record_web_search_total_failure()
     return None, (
         "Gemini Web Search Error: maximum retry attempts reached "
         "without a successful response."
@@ -1101,6 +1197,27 @@ def call_gemini_with_retry(user_prompt: str):
                     "exhaustion."
                 )
 
+                continue
+
+            # ------------------------------------------------------------
+            # 1b. BROKEN / REJECTED CREDENTIAL (not a rate limit -- retrying
+            # this key will never succeed). See _is_broken_credential's
+            # docstring for the current known cause (AQ.-format key issue).
+            # ------------------------------------------------------------
+            if _is_broken_credential(msg):
+                gemini_pool.mark_daily_quota(
+                    key_idx,
+                    reason="was REJECTED (401 UNAUTHENTICATED / invalid credential -- "
+                           "not a quota issue, see run header for details)"
+                )
+                print(
+                    f"[Gemini Brochure-audit] *** key {key_idx + 1} has an INVALID/REJECTED "
+                    f"credential (401 UNAUTHENTICATED) -- this is NOT a rate limit or quota "
+                    f"issue. Most likely cause right now: a known Google-side bug affecting "
+                    f"newly-issued 'AQ.'-prefix API keys. Check whether this key starts with "
+                    f"'AQ.' vs the older 'AIza...' format in AI Studio. Removed from rotation "
+                    f"for the rest of this run. ***"
+                )
                 continue
 
             # ------------------------------------------------------------
